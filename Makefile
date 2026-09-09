@@ -13,6 +13,10 @@ COMPILER_RT  := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
 QEMU         ?= qemu-system-aarch64
 OBJCOPY      ?= llvm-objcopy
 
+# Which CPU QEMU should model. cortex-a57 (default) has no 16KB granule;
+# a 16KB page build needs cortex-a76 or max (see docs/16k-pages.md).
+QEMU_CPU     ?= cortex-a57
+
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -c
@@ -47,7 +51,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/boot.o: src/boot.S | $(BUILD_DIR)
 	$(CLANG) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/kernel.o: src/kernel.mojo | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.o: src/kernel.mojo $(wildcard src/*.mojo) | $(BUILD_DIR)
 	$(MOJO) build $(MOJOFLAGS) $< -o $@
 
 $(KERNEL_ELF): $(LINKER_SCRIPT) $(OBJS)
@@ -83,13 +87,13 @@ userspace: $(INITRD)
 # kernel loads /init from the initrd and runs it at EL0. (Override INITRD or
 # APPEND on the command line if you want a different initramfs.)
 run-linux: $(KERNEL_BIN) $(INITRD)
-	@echo "--- Starting QEMU (Linux-protocol boot, initrd present) ---"
-	$(QEMU) -M virt -cpu cortex-a57 -nographic -kernel $(KERNEL_BIN) \
+	@echo "--- Starting QEMU (Linux-protocol boot, initrd present, -cpu $(QEMU_CPU)) ---"
+	$(QEMU) -M virt -cpu $(QEMU_CPU) -nographic -kernel $(KERNEL_BIN) \
 		-initrd $(INITRD) -append "$(APPEND)"
 
 run: $(KERNEL_ELF)
 	@echo "--- Starting QEMU (Press Ctrl+A then X to exit) ---"
-	$(QEMU) -M virt -cpu cortex-a57 -nographic -kernel $(KERNEL_ELF)
+	$(QEMU) -M virt -cpu $(QEMU_CPU) -nographic -kernel $(KERNEL_ELF)
 
 clean:
 	rm -rf $(BUILD_DIR)

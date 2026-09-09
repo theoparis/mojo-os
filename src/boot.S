@@ -62,12 +62,13 @@ _start:
 
 .Ljump_kernel:
     // Jump to the Mojo entry symbol. x0 = DTB physical address (preserved at
-    // _start). x1/x2 now carry the kernel's own static extent (linker
-    // symbols) so kmain can reserve it out of the physical allocator.
+    // _start). x1/x2 carry the kernel's own static extent (linker symbols),
+    // and x3 the level-2 page-table address, so kmain can reserve the
+    // kernel image and later grow L3 (4KB page) tables for userspace off it.
     mov     x0, x28
     ldr     x1, =__kernel_start
     ldr     x2, =__stack_top
-    mov     x3, x27
+    ldr     x3, =__page_table_l2
     bl      kmain
 
 // Fail-safe catch loop
@@ -105,24 +106,13 @@ _start:
 .equ DESC_TABLE,       0x3
 .equ DESC_UXN,         (1 << 54)
 .equ DESC_PXN,         (1 << 53)
-.equ DESC_AP_EL0,      (1 << 6)   // AP[2:1] = 01: EL1 RW + EL0 RW
 
-// The level-2 table's 2MB entries [USER_L2_FIRST, USER_L2_LAST] (inclusive)
-// are granted EL0 access -- this is where the first userspace process's
-// code and stack live. Must stay consistent with USER_REGION_BASE/SIZE
-// below (entries 8,9 => [0x40000000+8*2MB, 0x40000000+10*2MB) = 4MB).
-.equ USER_L2_FIRST,    8
-.equ USER_L2_LAST,     9
-
-// The EL0-accessible region itself: code/data are loaded starting at the
-// bottom (by elf.mojo's load_elf), and the initial stack starts at the
-// very top, growing down. Both MUST fall inside the AP-granted 2MB blocks
-// above -- unlike the kernel's own stack, this can't just be "whatever RAM
-// is free", since only this region has EL0 permission bits set.
-.equ USER_REGION_BASE, 0x41000000
-.equ USER_REGION_SIZE, 0x400000    // 4MB (USER_L2_LAST - USER_L2_FIRST + 1) * 2MB
-.equ USER_CODE_BASE,   USER_REGION_BASE
-.equ USER_STACK_TOP,   (USER_REGION_BASE + USER_REGION_SIZE)
+// No EL0 access is granted at boot: the whole RAM range is mapped EL1-only
+// with 2MB blocks. Userspace pages are instead mapped at 4KB granularity
+// later, on demand, by the kernel (src/paging.mojo) through lazily-created
+// level-3 tables hung off the level-2 table below -- each L3 entry can then
+// carry its own AP/UXN bits (read+exec code vs read-write data vs stack),
+// which is what a real process image needs.
 
 setup_mmu:
     stp     x30, x21, [sp, #-16]!
@@ -175,12 +165,6 @@ setup_mmu:
     orr     x0, x0, #DESC_AF
     orr     x0, x0, #DESC_SH_INNER
     orr     x0, x0, #DESC_BLOCK
-    cmp     x23, #USER_L2_FIRST
-    b.lt    .Ll2_store
-    cmp     x23, #USER_L2_LAST
-    b.gt    .Ll2_store
-    orr     x0, x0, #DESC_AP_EL0
-.Ll2_store:
     str     x0, [x22, x23, lsl #3]
     add     x24, x24, #0x200000
     add     x23, x23, #1
@@ -425,17 +409,22 @@ launch_el0:
     eret
 
 // ---------------------------------------------------------------------
-// EL0 self-test stub (proves the EL0 + syscall machinery before we build
-// an ELF loader): writes a message via the write syscall, then exits.
+// run_user: x0 = entry point of an already-loaded, already-mapped userspace
+// image; x1 = the EL0 stack top (kernel picks a mapped region for it). See
+// src/elf.mojo and src/paging.mojo -- mappings are created lazily per page.
 // ---------------------------------------------------------------------
-// run_user: x0 = entry point of an already-loaded userspace image (its
-// PT_LOAD segments must already sit at their final addresses, inside the
-// EL0-accessible region -- see elf.mojo's load_elf). Launches it with a
-// fresh EL0 stack.
 .global run_user
 run_user:
-    mov     x1, #USER_STACK_TOP
     b       launch_el0
+
+// flush_tlb_all: invalidate all TLB entries (TLBI VMALLE1IS + DSB + ISB).
+// Called from Mojo (paging.mojo) after page-table edits.
+.global flush_tlb_all
+flush_tlb_all:
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+    ret
 
 // uart_putc: character (zero-extended) in w0. Clobbers x1-x2.
 uart_putc:

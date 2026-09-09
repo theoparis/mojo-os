@@ -145,6 +145,22 @@ struct PhysAlloc:
             b = nxt
         return 0
 
+    def alloc_pages(mut self, npages: Int) -> UInt64:
+        """Return a 4KB-aligned, physically contiguous frame of `npages` pages.
+
+        The free-list allocator is 16-byte aligned, so we over-allocate by
+        one page and round the returned payload up to a 4KB boundary (the
+        rounded-up prefix is wasted on purpose). These frames are used for
+        kernel page tables (never freed), so there is deliberately no
+        matching free.
+        """
+        if npages <= 0:
+            return 0
+        var raw = self.alloc(npages * 4096 + 4096)
+        if raw == 0:
+            return 0
+        return (raw + UInt64(4095)) & 0xFFFFFFFFFFFFF000
+
     def free(mut self, addr: UInt64):
         """Return a block previously handed out by `alloc` to the free list."""
         if addr == 0 or addr < UInt64(PH_HDR):

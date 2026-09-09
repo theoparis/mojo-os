@@ -18,6 +18,7 @@ from console import print_int, print_str, print_uint, println, putc
 from dtb import BootParams, MemRegions, parse_dtb
 from elf import load_elf
 from mem import read_u8
+from paging import map_user_region
 from phys import PhysAlloc
 from ramfs import unpack_cpio
 
@@ -49,8 +50,8 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
     putc(0x0A)
 
 
-comptime USER_REGION_BASE: Int = 0x41000000
-comptime USER_REGION_SIZE: Int = 0x400000
+comptime USER_WINDOW_BASE: Int = 0x41000000
+comptime USER_STACK_SIZE: Int = 0x10000  # 64KB initial user stack
 
 
 def _report_memory(mem: MemRegions):
@@ -81,11 +82,15 @@ def _setup_allocator(
         return False
     # the running kernel image (text..stack), from boot.S
     alloc.reserve(klo, khi)
-    # the EL0-accessible user carve-out in the page tables (see boot.S)
-    alloc.reserve(
-        UInt64(USER_REGION_BASE), UInt64(USER_REGION_BASE + USER_REGION_SIZE)
-    )
-    # the cpio initrd and the DTB image itself
+    # Reserve the *entire* userspace window -- everything from
+    # USER_WINDOW_BASE up to the top of RAM. Pages there are later granted
+    # EL0 access at 4KB granularity (paging.mojo), so the allocator must
+    # never hand them out for kernel structures; kernel heap and page
+    # tables come from the free RAM below the window instead.
+    if mem.end(0) > UInt64(USER_WINDOW_BASE):
+        alloc.reserve(UInt64(USER_WINDOW_BASE), mem.end(0))
+    # the cpio initrd and the DTB image itself (defensive; both already sit
+    # inside the window above, but keep the reservations explicit)
     if bp.has_initrd:
         alloc.reserve(bp.initrd_start, bp.initrd_end)
     if bp.dtb_end > bp.dtb_start:
@@ -127,9 +132,13 @@ def ksyscall(
     return 0xFFFFFFFFFFFFFFDA
 
 
-def _run_user(entry: Int):
-    """Drop to EL0 at `entry` with a fresh stack (see boot.S:run_user)."""
-    external_call["run_user", NoneType](entry)
+def _run_user(entry: Int, sp: Int):
+    """Drop to EL0 at `entry` with the EL0 stack pointer at `sp`.
+
+    All the pages the image needs must already be mapped with EL0 access
+    (see paging.mojo / elf.mojo); boot.S:run_user just erets.
+    """
+    external_call["run_user", NoneType](entry, sp)
 
 
 @export("kmain")
@@ -142,9 +151,11 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
     )
 
     # x0 = DTB physical address (Linux boot protocol); x1/x2 = kernel image
-    # static extent [start, end) as loaded by boot.S from linker symbols.
+    # static extent [start, end); x3 = level-2 page-table address, as set up
+    # by boot.S from linker symbols.
     var kernel_lo = UInt64(x1)
     var kernel_hi = UInt64(x2)
+    var l2base = x3
     var mem = MemRegions()
     var bp = parse_dtb(x0, mem)
     if not bp.has_dtb:
@@ -216,12 +227,28 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             print_uint(UInt64(fs.entry_mode(idx)), 8)
             print_str(")\n")
 
-            var entry = load_elf(fs.data_addr(idx))
+            var entry = load_elf(alloc, l2base, fs.data_addr(idx))
             if entry != 0:
-                print_str("[elf] entry=0x")
+                # Give the process a stack at the top of RAM: map a window
+                # of pages just below the top of the DTB-reported RAM and
+                # start SP_EL0 there, growing down.
+                var ram_end = Int(mem.end(0))
+                var stack_top = ram_end & ~15
+                var stack_base = stack_top - USER_STACK_SIZE
+                if map_user_region(
+                    alloc, l2base, stack_base, USER_STACK_SIZE, False
+                ):
+                    print_str("[user] stack [0x")
+                    print_uint(UInt64(stack_base), 16)
+                    print_str(", 0x")
+                    print_uint(UInt64(stack_top), 16)
+                    print_str(")\n")
+                else:
+                    print_str("[user] stack mapping failed\n")
+                print_str("[user] entry=0x")
                 print_uint(UInt64(entry), 16)
                 print_str("\n[user] dropping to EL0...\n")
-                _run_user(entry)
+                _run_user(entry, stack_top)
             else:
                 print_str("[elf] failed to load /init\n")
         else:
