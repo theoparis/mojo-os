@@ -15,9 +15,10 @@ from std.sys.defines import MOJO_VERSION
 from std.sys.info import CompilationTarget
 
 from console import print_int, print_str, print_uint, println, putc
-from dtb import BootParams, parse_dtb
+from dtb import BootParams, MemRegions, parse_dtb
 from elf import load_elf
 from mem import read_u8
+from phys import PhysAlloc
 from ramfs import unpack_cpio
 
 
@@ -46,6 +47,51 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
     for i in range(msg_len):
         putc(ptr[unsafe_offset=i])
     putc(0x0A)
+
+
+comptime USER_REGION_BASE: Int = 0x41000000
+comptime USER_REGION_SIZE: Int = 0x400000
+
+
+def _report_memory(mem: MemRegions):
+    """Print the RAM regions read from the DTB /memory node."""
+    print_str("[mem] ")
+    print_uint(UInt64(mem.n()), 10)
+    print_str(" region(s):\n")
+    for i in range(mem.n()):
+        print_str("      [0x")
+        print_uint(mem.base(i), 16)
+        print_str(", 0x")
+        print_uint(mem.end(i), 16)
+        print_str(")  size=0x")
+        print_uint(mem.size(i), 16)
+        putc(0x0A)
+
+
+def _setup_allocator(
+    mut alloc: PhysAlloc,
+    mem: MemRegions,
+    bp: BootParams,
+    klo: UInt64,
+    khi: UInt64,
+) -> Bool:
+    """Configure `alloc` over the first DTB RAM region, reserving all the
+    ranges the kernel already occupies so it won't hand them out."""
+    if mem.n() < 1:
+        return False
+    # the running kernel image (text..stack), from boot.S
+    alloc.reserve(klo, khi)
+    # the EL0-accessible user carve-out in the page tables (see boot.S)
+    alloc.reserve(
+        UInt64(USER_REGION_BASE), UInt64(USER_REGION_BASE + USER_REGION_SIZE)
+    )
+    # the cpio initrd and the DTB image itself
+    if bp.has_initrd:
+        alloc.reserve(bp.initrd_start, bp.initrd_end)
+    if bp.dtb_end > bp.dtb_start:
+        alloc.reserve(bp.dtb_start, bp.dtb_end)
+    alloc.init(mem.base(0), mem.end(0))
+    return True
 
 
 @export("ksyscall")
@@ -95,9 +141,12 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         t" running on QEMU!\n"
     )
 
-    # x0 is the physical address of the DTB handed to us by QEMU (Linux
-    # boot protocol). Everything else hangs off it.
-    var bp = parse_dtb(x0)
+    # x0 = DTB physical address (Linux boot protocol); x1/x2 = kernel image
+    # static extent [start, end) as loaded by boot.S from linker symbols.
+    var kernel_lo = UInt64(x1)
+    var kernel_hi = UInt64(x2)
+    var mem = MemRegions()
+    var bp = parse_dtb(x0, mem)
     if not bp.has_dtb:
         print_str("[dtb] none passed in x0\n")
     else:
@@ -122,6 +171,31 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             print_str('"\n')
         else:
             print_str("[cmdline] (none)\n")
+
+    # Report the RAM we learned about from the DTB, then build a physical
+    # allocator over it (reserving everything the kernel already owns) and
+    # exercise alloc/free. This is the memory backend brk/mmap will draw
+    # pages from as we move toward running busybox.
+    _report_memory(mem)
+    var alloc = PhysAlloc()
+    if _setup_allocator(alloc, mem, bp, kernel_lo, kernel_hi):
+        print_str("[alloc] total free: 0x")
+        print_uint(alloc.free_total(), 16)
+        putc(0x0A)
+        var pa = alloc.alloc(64)
+        var pb = alloc.alloc(0x1000)
+        print_str("[alloc] alloc(64)=0x")
+        print_uint(pa, 16)
+        print_str("  alloc(4096)=0x")
+        print_uint(pb, 16)
+        putc(0x0A)
+        alloc.free(pa)
+        alloc.free(pb)
+        print_str("[alloc] after free:  0x")
+        print_uint(alloc.free_total(), 16)
+        putc(0x0A)
+    else:
+        print_str("[alloc] no RAM region from /memory\n")
 
     # If QEMU loaded a cpio initrd for us, unpack it into a ramfs and
     # demonstrate that we can list and look up files in it (the first step

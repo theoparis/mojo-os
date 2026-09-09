@@ -52,6 +52,13 @@ def read_u32(addr: Int) -> UInt32:
     return p[]
 
 
+def write_u64(addr: Int, value: UInt64):
+    var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    p[] = value
+
+
 def read_u64(addr: Int) -> UInt64:
     """Native (little-endian) 64-bit read -- for ELF fields, not the DTB."""
     var p = Pointer[mut=False, T=UInt64, origin=UntrackedOrigin[mut=False]](

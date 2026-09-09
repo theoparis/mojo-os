@@ -35,9 +35,10 @@ make run
 | `src/linker.ld` | kernel layout (linked at 0x40080000, matches QEMU's raw + ELF load) |
 | `src/mem.mojo` | raw memory accessors (MMIO, reads, byteswaps) |
 | `src/console.mojo` | PL011 UART + libc-free formatting |
-| `src/dtb.mojo` | device-tree `/chosen` parser (initrd range + cmdline) |
+| `src/dtb.mojo` | device-tree parser: `/chosen` (initrd + cmdline) and `/memory` (RAM ranges) |
 | `src/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
 | `src/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
+| `src/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
 | `src/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |
 | `src/kernel.mojo` | `kmain` orchestration + `ksyscall` + runtime `@export`s |
 | `src/user/` | freestanding userspace source + link script |

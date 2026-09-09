@@ -8,6 +8,7 @@ SECTIONS
      * addresses (vector table via VBAR_EL1, page tables, stacks) line up
      * with where the image is actually resident under either boot method. */
     . = 0x40080000;
+    __kernel_start = .;
 
     .text : {
         KEEP(*(.text.boot))
@@ -60,6 +61,10 @@ SECTIONS
     __stack_bottom = .;
     . += 0x10000;
     __stack_top = .;
+
+    /* End of the kernel's own static image (text..stack). Everything from
+     * __kernel_start to here is reserved out of the physical allocator. */
+    __kernel_end = __stack_top;
 
     /DISCARD/ : {
         *(.comment)

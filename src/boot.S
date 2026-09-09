@@ -61,12 +61,13 @@ _start:
     bl      setup_mmu
 
 .Ljump_kernel:
-    // Jump to the Mojo entry symbol, handing over the boot parameters
-    // preserved at _start (x0 = DTB physical address).
+    // Jump to the Mojo entry symbol. x0 = DTB physical address (preserved at
+    // _start). x1/x2 now carry the kernel's own static extent (linker
+    // symbols) so kmain can reserve it out of the physical allocator.
     mov     x0, x28
-    mov     x1, x27
-    mov     x2, x26
-    mov     x3, x25
+    ldr     x1, =__kernel_start
+    ldr     x2, =__stack_top
+    mov     x3, x27
     bl      kmain
 
 // Fail-safe catch loop
