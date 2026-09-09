@@ -33,7 +33,7 @@ from kstate import (
     user_map,
 )
 from mem import read_u16, read_u8, write_u8
-from paging import USER_VA_TOP, map_user
+from paging import USER_VA_TOP, init_user_vm, map_user
 from phys import PAGE_SIZE, PhysAlloc
 from ramfs import unpack_cpio
 
@@ -440,6 +440,10 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         print_str("[alloc] total free: 0x")
         print_uint(alloc.free_total(), 16)
         putc(0x0A)
+        # Prepare the low user VA space before any user mapping. On 16KB
+        # this is a no-op; on 4KB it splits L1[0] into a level-2 table.
+        if not init_user_vm(alloc, l1base):
+            print_str("[paging] init_user_vm failed\n")
     else:
         print_str("[alloc] no RAM region from /memory\n")
 

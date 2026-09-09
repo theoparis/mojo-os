@@ -41,15 +41,19 @@ SECTIONS
     }
     __bss_end = .;
 
-    /* The single top-level translation table for the 16KB granule: 2048 x
-     * 8B descriptors = 16KB. With T0SZ=32 (4GB VA) the 16KB-granule walk
-     * uses two levels, and this top table is indexed by VA[31:25]; each
-     * entry is either a 32MB block descriptor (devices/RAM, identity) or a
-     * pointer to a lazily-created 2048-entry leaf table for userspace pages
-     * (see src/paging.mojo). Zeroed + filled by boot.S. Must be 16KB
-     * aligned for TTBR0. */
+    /* Static translation tables (both reserved 16KB-aligned, whichever the
+     * granule build uses). With the 16KB granule, __page_table is the single
+     * 2048-entry top table (indexed VA[31:25]) and __page_table_l2 is unused.
+     * With the 4KB granule, __page_table is the 512-entry L1 and
+     * __page_table_l2 the 512-entry L2 of RAM blocks (L1[1]). boot.S zeroes
+     * and fills what it needs. Table base must be aligned to the granule's
+     * table size for TTBR0. */
     . = ALIGN(0x4000);
     __page_table = .;
+    . += 0x4000;
+
+    . = ALIGN(0x4000);
+    __page_table_l2 = .;
     . += 0x4000;
 
     /* Reserve a stack region for EL1 (grows downward from __stack_top).

@@ -13,16 +13,22 @@ COMPILER_RT  := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
 QEMU         ?= qemu-system-aarch64
 OBJCOPY      ?= llvm-objcopy
 
-# Which CPU QEMU should model. The kernel is built for the 16KB
-# translation granule, so it needs a CPU that implements it (TGran16).
-# cortex-a57 has no 16KB granule; use cortex-a76 (or max) -- boot.S prints
-# a clear error if the emulated CPU lacks it.
-QEMU_CPU     ?= cortex-a76
+# Which CPU QEMU should model. 4KB (PAGE_SHIFT=12) runs on cortex-a57;
+# 16KB (PAGE_SHIFT=14) needs cortex-a76 or max (boot.S checks TGran16 and
+# prints a clear error if the emulated CPU lacks the 16KB granule).
+QEMU_CPU     ?= $(if $(filter 14,$(PAGE_SHIFT)),cortex-a76,cortex-a57)
+
+# Translation granule the kernel is built for: 12 = 4KB (default; runs on
+# any ARMv8 incl. cortex-a57), 14 = 16KB (needs a CPU with the 16KB
+# granule, e.g. QEMU cortex-a76/max). Drives boot.S (TCR TG0 + table
+# geometry) via ASFLAGS and Mojo (PAGE_SHIFT in phys.mojo/paging.mojo) via
+# MOJOFLAGS. See docs/16k-pages.md.
+PAGE_SHIFT   ?= 12
 
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
-ASFLAGS      := --target=$(TARGET) -march=armv8-a -c
-MOJOFLAGS    := -mojo-search-paths $(MOJO_STDLIB) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+ASFLAGS      := --target=$(TARGET) -march=armv8-a -DPAGE_SHIFT=$(PAGE_SHIFT) -c
+MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) -mojo-search-paths $(MOJO_STDLIB) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 # Freestanding userspace binaries are compiled with clang for a bare
 # `-none-` triple (no OS, no libc) and linked as static non-PIE ET_EXEC by

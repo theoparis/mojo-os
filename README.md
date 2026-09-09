@@ -21,11 +21,20 @@ the kernel.
 
 ```sh
 # Full Linux-style boot: raw image + DTB + cpio initrd, runs /init at EL0.
+# Default build is the 4KB granule (runs on cortex-a57).
 make run-linux
+
+# 16KB-granule build (needs a CPU with the 16KB granule; Makefile picks
+# cortex-a76 automatically).
+make PAGE_SHIFT=14 run-linux
 
 # Boot the kernel by itself (ELF path, no initrd/userspace).
 make run
 ```
+
+PAGE_SHIFT selects the translation granule (12 = 4KB default, 14 = 16KB)
+and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
+(phys.mojo/paging.mojo). See docs/16k-pages.md.
 
 ## Source layout
 
@@ -39,10 +48,10 @@ make run
 | `src/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
 | `src/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
 | `src/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
-| `src/paging.mojo` | real user VA space (low 128MB, VA≠PA) on the 16KB granule: lazily-created 2048-entry leaf tables, per-16KB-page EL0 perms, frames from the allocator |
+| `src/paging.mojo` | real user VA space (low 128MB, VA≠PA): PAGE_SHIFT selects the 4KB/16KB granule; lazily-created leaf tables, per-page EL0 perms, frames from the allocator |
 | `src/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |
 | `src/kernel.mojo` | `kmain` orchestration + `ksyscall` + runtime `@export`s |
 | `src/user/` | freestanding userspace source + link script (linked at 0x400000, the standard low VA busybox/musl uses) |
 | `tools/mkcpio.mojo` | native Mojo tool that builds the cpio initrd |
 | `mojo.patch` | compiler/stdlib patches the patched Mojo build requires |
-| `docs/16k-pages.md` | analysis of the 16KB-granule MMU (implemented: PAGE_SHIFT=14, -cpu cortex-a76) |
+| `docs/16k-pages.md` | analysis of the 16KB-granule MMU (implemented & selectable via PAGE_SHIFT) |

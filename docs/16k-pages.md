@@ -1,10 +1,11 @@
 # Supporting 16KB pages (granule) on mojo-os
 
-> **Status: implemented.** The kernel now boots on the 16KB granule
-> (PAGE_SHIFT=14 in src/phys.mojo; TCR TG0=0b10; boot.S builds a single top
-> table indexed by VA[31:25] with lazily-created 2048-entry leaf tables;
-> QEMU needs `-cpu cortex-a76` or `max`). The rest of this document records
-> the analysis that drove the change.
+> **Status: implemented & selectable.** The translation granule is a build
+> option: `make PAGE_SHIFT=12` (default) = 4KB, `make PAGE_SHIFT=14` = 16KB.
+> PAGE_SHIFT (read via the `-D` build define in src/phys.mojo) drives TCR
+> TG0, boot.S's table geometry, and paging.mojo. 16KB needs `-cpu
+> cortex-a76`/`max` (Makefile picks it automatically; boot.S checks TGran16).
+> The rest of this document records the analysis that drove the change.
 
 ## Translation granule background
 

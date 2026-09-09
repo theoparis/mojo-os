@@ -18,6 +18,8 @@
 # free list; `free` relinks a block. Blocks are not coalesced -- acceptable
 # for a first allocator whose main consumer will be handing out pages for
 # user (brk/mmap) mappings, which grow monotonically for the most part.
+from std.sys.defines import get_defined_int
+
 from mem import read_u64, write_u64
 
 comptime PH_MAGIC: UInt64 = 0xF3EE_F3EE_F3EE_F3EE
@@ -26,13 +28,14 @@ comptime PH_ALIGN: Int = 16
 comptime PH_MIN_BLOCK: Int = PH_HDR + PH_ALIGN
 comptime PH_RES_MAX: Int = 16
 
-# Page geometry (16KB translation granule). PAGE_SHIFT selects the granule
-# the whole kernel is built for; boot.S (TCR TG0 + table sizes/loops) and
-# src/paging.mojo must match, and QEMU needs a CPU that implements the 16KB
-# granule (cortex-a76/max). Reverting to PAGE_SHIFT=12 (4KB) requires the
-# matching boot.S table geometry (see docs/16k-pages.md).
-comptime PAGE_SHIFT: Int = 14
-comptime PAGE_SIZE: Int = 1 << PAGE_SHIFT  # 16384
+# Page geometry. PAGE_SHIFT selects the translation granule the whole
+# kernel is built for: 12 = 4KB (default, runs on any ARMv8 incl.
+# cortex-a57), 14 = 16KB (needs a CPU with the 16KB granule, e.g. QEMU
+# cortex-a76/max; boot.S checks TGran16). boot.S (TCR TG0 + table geometry)
+# and src/paging.mojo must match -- build with `make PAGE_SHIFT=14`. See
+# docs/16k-pages.md.
+comptime PAGE_SHIFT: Int = get_defined_int["PAGE_SHIFT", 12]()
+comptime PAGE_SIZE: Int = 1 << PAGE_SHIFT  # 4096 or 16384
 comptime PAGE_MASK: Int = PAGE_SIZE - 1
 
 
