@@ -9,6 +9,7 @@
 # These exports must live in the top-level module passed to `mojo build`,
 # because an @export in an imported-but-unreferenced module is not emitted.
 from std.memory.pointer import Pointer
+from std.ffi import external_call
 from std.origin import MutUntrackedOrigin, UntrackedOrigin
 from std.sys.defines import MOJO_VERSION
 from std.sys.info import CompilationTarget
@@ -44,6 +45,44 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
     for i in range(msg_len):
         putc(ptr[unsafe_offset=i])
     putc(0x0A)
+
+
+@export("ksyscall")
+def ksyscall(
+    n: UInt64,
+    a0: UInt64,
+    a1: UInt64,
+    a2: UInt64,
+    a3: UInt64,
+    a4: UInt64,
+    a5: UInt64,
+) abi("C") -> UInt64:
+    """Linux syscall dispatcher (arm64 numbers). Called from the EL0 trap.
+
+    x8 holds the number; args are in x0..x5. For now a minimal subset that
+    our tiny static userspace needs.
+    """
+    _ = a3
+    _ = a4
+    _ = a5
+    # __NR_write = 64: write(fd, buf, count). We ignore fd and write to UART.
+    if n == 64:
+        var buf = Int(a1)
+        var cnt = Int(a2)
+        for i in range(cnt):
+            putc(read_u8(buf + i))
+        return UInt64(cnt)
+    # __NR_exit = 93 / __NR_exit_group = 94: never return.
+    if n == 93 or n == 94:
+        while True:
+            _ = 0
+    # Unsupported: return -ENOSYS (-38).
+    return 0xFFFFFFFFFFFFFFDA
+
+
+def _run_el0_selftest():
+    """Drop to EL0 and run the assembly self-test stub (no ELF yet)."""
+    external_call["__run_el0_selftest", NoneType]()
 
 
 @export("kmain")
@@ -107,6 +146,11 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             putc(0x0A)
         else:
             print_str("[ramfs] /init not found\n")
+
+    # Prove the EL0 machinery: drop to user mode, have the self-test stub
+    # issue a write syscall that prints to the UART, then exit.
+    print_str("\n[user] dropping to EL0...\n")
+    _run_el0_selftest()
 
     while True:
         _ = 0
