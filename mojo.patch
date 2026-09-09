@@ -1,0 +1,202 @@
+diff --git a/Mojo/lib/KGENToLLVM/LowerPOPToLLVMExternalCalls.cpp b/Mojo/lib/KGENToLLVM/LowerPOPToLLVMExternalCalls.cpp
+index f79fc035b0..6cf7e94c5f 100644
+--- a/Mojo/lib/KGENToLLVM/LowerPOPToLLVMExternalCalls.cpp
++++ b/Mojo/lib/KGENToLLVM/LowerPOPToLLVMExternalCalls.cpp
+@@ -302,7 +302,20 @@ public:
+                  .attachNote(func.getLoc())
+              << "see function declaration here";
+     }
+-    if (func &&
++    // Only enforce attribute agreement against a *bare declaration* created
++    // by an earlier `pop.external_call` to the same symbol (i.e. a genuinely
++    // external/foreign function whose expected ABI attributes we're free to
++    // pin down here). A symbol that already has a body was lowered from a
++    // real Mojo `kgen.func` definition (e.g. `@export`) by `ConvertKGENFunc`,
++    // which does not populate `passthrough`/`argAttrs`/`resAttrs` the same
++    // way this pass independently computes them for a foreign declaration
++    // (e.g. `attachTargetPassthroughAttrs` always injects `target-cpu`/
++    // `target-features`, which `ConvertKGENFunc` leaves for a later, uniform
++    // pass to attach to every function). Comparing against that not-yet-
++    // finalized definition would spuriously reject any program that both
++    // defines and `external_call`s the same symbol. The signature check
++    // above remains the load-bearing correctness guard in that case.
++    if (func && func.isExternal() &&
+         std::make_tuple(func.getPassthroughAttr(), func.getArgAttrsAttr(),
+                         func.getResAttrsAttr(), func.getMemoryEffectsAttr()) !=
+             std::make_tuple(passthrough, expectedArgAttrs, expectedResAttrs,
+diff --git a/Mojo/stdlib/std/_plugin/_overlay.mojo b/Mojo/stdlib/std/_plugin/_overlay.mojo
+index 4adc885baa..5a2c69acae 100644
+--- a/Mojo/stdlib/std/_plugin/_overlay.mojo
++++ b/Mojo/stdlib/std/_plugin/_overlay.mojo
+@@ -13,10 +13,11 @@
+ 
+ from ._trait import DefaultPlugin, PluginHooks
+ from .selector import PluginSelector
++from .baremetal import BareMetalPlugin
+ from .cuda import CUDAPlugin
+ from .hip import HIPPlugin
+ from .metal import MetalPlugin
+ 
+ comptime STD_PLUGINS = PluginSelector[
+-    DefaultPlugin, MetalPlugin, CUDAPlugin, HIPPlugin
++    DefaultPlugin, MetalPlugin, CUDAPlugin, HIPPlugin, BareMetalPlugin
+ ]
+diff --git a/Mojo/stdlib/std/_plugin/baremetal/__init__.mojo b/Mojo/stdlib/std/_plugin/baremetal/__init__.mojo
+new file mode 100644
+index 0000000000..64dc60bd0a
+--- /dev/null
++++ b/Mojo/stdlib/std/_plugin/baremetal/__init__.mojo
+@@ -0,0 +1,14 @@
++# ===----------------------------------------------------------------------=== #
++# Copyright (c) 2026, Modular Inc. All rights reserved.
++#
++# Licensed under the Apache License v2.0 with LLVM Exceptions:
++# https://llvm.org/LICENSE.txt
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ===----------------------------------------------------------------------=== #
++
++from .baremetal_plugin import BareMetalPlugin
+diff --git a/Mojo/stdlib/std/_plugin/baremetal/baremetal_plugin.mojo b/Mojo/stdlib/std/_plugin/baremetal/baremetal_plugin.mojo
+new file mode 100644
+index 0000000000..fdc97b91f8
+--- /dev/null
++++ b/Mojo/stdlib/std/_plugin/baremetal/baremetal_plugin.mojo
+@@ -0,0 +1,75 @@
++# ===----------------------------------------------------------------------=== #
++# Copyright (c) 2026, Modular Inc. All rights reserved.
++#
++# Licensed under the Apache License v2.0 with LLVM Exceptions:
++# https://llvm.org/LICENSE.txt
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ===----------------------------------------------------------------------=== #
++
++from std._plugin._trait import PluginHooks
++from std.collections.string.string_span import _get_kgen_string
++from std.ffi import external_call
++from std.reflection import SourceLocation
++
++
++struct BareMetalPlugin(PluginHooks):
++    """`PluginHooks` implementation for freestanding/bare-metal targets
++    (a triple whose OS component is `none`, e.g. `aarch64-unknown-none-elf`).
++
++    There is no libc to link against on these targets, so `debug_assert`'s
++    default failure path (`_printf` -> `KGEN_CompilerRT_fprintf` ->
++    `vfprintf`, plus the `fdopen`/`dup`/`fclose` FILE* plumbing) is
++    unusable. This plugin instead dispatches the failure message to a
++    single fixed-arity extern symbol, `__mojo_baremetal_debug_write`, that
++    the freestanding program (kernel) is expected to define with
++    `@export("__mojo_baremetal_debug_write") ... abi("C")`. `abort()`'s
++    fallback (`llvm.intr.trap`) is already libc-free, so `abort_fn` is left
++    at its default no-op.
++    """
++
++    comptime name: __mlir_type.`!kgen.string` = _get_kgen_string["baremetal"]()
++
++    comptime _handles_debug_assert: Bool = True
++
++    @staticmethod
++    def debug_assert_emit_fn[
++        O: Origin
++    ](message: Pointer[Byte, O], length: Int, loc: SourceLocation):
++        """Forwards the assertion message to the program-supplied sink.
++
++        The freestanding program must define a matching symbol, e.g.:
++
++        ```mojo
++        @export("__mojo_baremetal_debug_write")
++        def _debug_write(message: Pointer[Byte, ImmAnyOrigin], length: Int) abi("C"):
++            for i in range(length):
++                putc(message[unsafe_offset=i])
++        ```
++
++        Parameters:
++            O: The origin of the message pointer.
++
++        Args:
++            message: Pointer to the nul-terminated message bytes.
++            length: Length in bytes (excluding the trailing nul).
++            loc: Source location of the failing assertion. Not currently
++                forwarded — the message already carries the relevant
++                context for a "safe"-mode `check_bounds` failure.
++        """
++        _ = loc
++        # Pass a raw integer address rather than a typed `Pointer` across the
++        # FFI boundary: `Pointer`'s concrete origin (an implementation detail
++        # of whichever stdlib caller reaches this hook) can carry
++        # alias/lifetime attributes that don't match a freestanding
++        # program's own concrete `Pointer` type at the same symbol, which
++        # the backend then rejects as "conflicting attributes" on the two
++        # declarations of one external symbol. An address (`Int`) has no
++        # such attributes and is unambiguous.
++        external_call["__mojo_baremetal_debug_write", NoneType](
++            Int(message), length
++        )
+diff --git a/Mojo/stdlib/std/format/_utils.mojo b/Mojo/stdlib/std/format/_utils.mojo
+index 7306b2322f..03466e98dd 100644
+--- a/Mojo/stdlib/std/format/_utils.mojo
++++ b/Mojo/stdlib/std/format/_utils.mojo
+@@ -19,6 +19,8 @@ intended for public use and may change without notice.
+ 
+ from std.io.io import _printf
+ from std.os import abort
++from std._plugin import CurrentPlugin
++from std.reflection import call_location
+ from std.reflection.type_info import _unqualified_type_name
+ from std.sys import size_of
+ from std.sys.info import is_gpu
+@@ -393,10 +395,17 @@ def _fixed_buffer_exceeded() -> Never:
+     so this rarely-taken path doesn't duplicate its `_printf`/`abort` sequence
+     at every `_FixedWriteBuffer` write site.
+     """
+-    _printf[
+-        "FIXED_WRITE_BUFFER_BYTES exceeded, increase with: `mojo -D"
+-        " FIXED_WRITE_BUFFER_BYTES=4096`\n"
+-    ]()
++    comptime msg = "FIXED_WRITE_BUFFER_BYTES exceeded, increase with: `mojo -D FIXED_WRITE_BUFFER_BYTES=4096`"
++    # Same rationale as `_debug_assert_msg`: targets without a usable
++    # `_printf` (e.g. bare metal) register a `PluginHooks` that handles
++    # message emission directly, comptime-eliding this `_printf` fallback
++    # (which would otherwise need libc's `fdopen`/`fprintf`/etc).
++    comptime if CurrentPlugin._handles_debug_assert:
++        CurrentPlugin.debug_assert_emit_fn(
++            msg.ptr(), msg.byte_length(), call_location()
++        )
++    else:
++        _printf[msg + "\n"]()
+     abort()
+ 
+ 
+diff --git a/Support/lib/MDialect/MAttrs.cpp b/Support/lib/MDialect/MAttrs.cpp
+index 2e134a1669..69e13c4ea3 100644
+--- a/Support/lib/MDialect/MAttrs.cpp
++++ b/Support/lib/MDialect/MAttrs.cpp
+@@ -1194,9 +1194,15 @@ M::getTargetInfoFor(MLIRContext *ctx, StringRef targetTriple, StringRef arch,
+   }
+ 
+   int32_t pointerBitWidth = dl->getPointerBitWidth();
+-  // The plugin name is only set on targets built from Mojo; targets built here
+-  // get the default.
+-  return TargetInfoAttr::get(ctx, llvm::Triple(targetTriple), arch, "default",
++  // The plugin name is only set on targets built from Mojo; targets built
++  // here get the default, except for freestanding/bare-metal targets (an
++  // OS component of "none", e.g. `aarch64-unknown-none-elf`), which select
++  // the "baremetal" plugin so `debug_assert`/`abort` avoid the libc-backed
++  // `_printf` fallback (there is no libc to link against).
++  llvm::Triple triple(targetTriple);
++  StringRef stdlibPlugin =
++      triple.getOSName() == "none" ? "baremetal" : "default";
++  return TargetInfoAttr::get(ctx, triple, arch, stdlibPlugin,
+                              resolvedFeatures, std::move(*dl),
+                              machine->getRelocationModel(),
+                              simdWidthFromFeatures(StringRef(resolvedFeatures)),

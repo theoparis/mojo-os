@@ -1,12 +1,16 @@
 CLANG        ?= clang
 LLD          ?= ld.lld
-MOJO         ?= mojo
+# Custom-built mojo (work/modular) that auto-selects the "baremetal" stdlib
+# plugin for `-none-` target triples, so `debug_assert`/`abort` work without
+# libc. The stock nix-packaged mojo does not have this patch.
+MOJO         ?= work/modular/bazel-bin/Mojo/tools/mojo/mojo
+MOJO_STDLIB  ?= work/modular/Mojo/stdlib
 QEMU         ?= qemu-system-aarch64
 
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -c
-MOJOFLAGS    := --emit object --target-triple=$(TARGET_TRIPLE) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := -mojo-search-paths $(MOJO_STDLIB) --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 BUILD_DIR    := build
 KERNEL_ELF   := $(BUILD_DIR)/kernel.elf
