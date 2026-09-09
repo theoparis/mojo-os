@@ -118,9 +118,9 @@ def _memcpy(dest: Int, src: Int, n: Int) abi("C") -> Int:
     var d = Pointer[mut=True, T=UInt8, origin=MutUntrackedOrigin](
         unsafe_from_address=dest
     )
-    var s = Pointer[
-        mut=False, T=UInt8, origin=UntrackedOrigin[mut=False]
-    ](unsafe_from_address=src)
+    var s = Pointer[mut=False, T=UInt8, origin=UntrackedOrigin[mut=False]](
+        unsafe_from_address=src
+    )
     for i in range(n):
         d[unsafe_offset=i] = s[unsafe_offset=i]
     return dest
@@ -128,11 +128,11 @@ def _memcpy(dest: Int, src: Int, n: Int) abi("C") -> Int:
 
 @export("__mojo_baremetal_debug_write")
 def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
-    var ptr = Pointer[
-        mut=False, T=UInt8, origin=UntrackedOrigin[mut=False]
-    ](unsafe_from_address=message_addr)
+    var ptr = Pointer[mut=False, T=UInt8, origin=UntrackedOrigin[mut=False]](
+        unsafe_from_address=message_addr
+    )
     var msg_len = length
-    if msg_len > 0 and ptr[unsafe_offset = msg_len - 1] == 0:
+    if msg_len > 0 and ptr[unsafe_offset=msg_len - 1] == 0:
         msg_len -= 1
     print_str("[ASSERT] ")
     for i in range(msg_len):
@@ -143,7 +143,11 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
 @export("kmain")
 def kmain() abi("C"):
     var arch = StringLiteral[CompilationTarget[].__triple_arch()]()
-    println(t"Hello from bare-metal {arch}, built with Mojo {MOJO_VERSION.major}.{MOJO_VERSION.minor}.{MOJO_VERSION.patch}, running on QEMU!\n")
+    println(
+        t"Hello from bare-metal {arch}, built with Mojo"
+        t" {MOJO_VERSION.major}.{MOJO_VERSION.minor}.{MOJO_VERSION.patch},"
+        t" running on QEMU!\n"
+    )
 
     while True:
         _ = 0
