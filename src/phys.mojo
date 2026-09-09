@@ -114,6 +114,16 @@ struct PhysAlloc:
         if cur < end:
             self._link_free(cur, end)
 
+    def attach(mut self, head: UInt64, base: UInt64, end: UInt64):
+        """Adopt an existing free list (e.g. rebuilt from kernel state) so
+        syscall handlers can alloc/map without re-running `init` (which
+        would need the reservation list we no longer keep).
+        """
+        self.ram_base = base
+        self.ram_end = end
+        self.nres = 0
+        self.free_head = head
+
     def alloc(mut self, n: Int) -> UInt64:
         """Return the physical address of `n` bytes (payload), or 0 on fail."""
         if n <= 0:

@@ -30,6 +30,14 @@ SECTIONS
     __bss_start = .;
     .bss : {
         *(.bss .bss.*)
+
+        /* Kernel state shared between kmain and the syscall dispatcher
+         * (brk/mmap cursors, allocator free-list head, page-table base...).
+         * Lives inside .bss so boot.S zeroes it like the rest of BSS.
+         * Fields are accessed by offset from __kstate (see src/kstate.mojo). */
+        . = ALIGN(8);
+        __kstate = .;
+        . += 256;
     }
     __bss_end = .;
 

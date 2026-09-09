@@ -16,11 +16,58 @@ from std.sys.info import CompilationTarget
 
 from console import print_int, print_str, print_uint, println, putc
 from dtb import BootParams, MemRegions, parse_dtb
-from elf import load_elf
-from mem import read_u8
+from elf import elf_image_end, elf_phdrs, load_elf
+from kstate import (
+    OFF_FREE_HEAD,
+    OFF_L2,
+    OFF_RAM_BASE,
+    OFF_RAM_END,
+    OFF_USER_BASE,
+    OFF_USER_HI,
+    brk_cur,
+    get64,
+    mmap_next,
+    set64,
+    set_brk,
+    set_mmap_next,
+    user_hi,
+    user_map,
+)
+from mem import read_u16, read_u8, write_u8
 from paging import map_user_region
 from phys import PhysAlloc
 from ramfs import unpack_cpio
+
+# aarch64 Linux syscall numbers we implement or recognize
+comptime SYS_WRITE: UInt64 = 64
+comptime SYS_READ: UInt64 = 63
+comptime SYS_EXIT: UInt64 = 93
+comptime SYS_EXIT_GROUP: UInt64 = 94
+comptime SYS_BRK: UInt64 = 214
+comptime SYS_MMAP: UInt64 = 222
+comptime SYS_MUNMAP: UInt64 = 215
+comptime SYS_MPROTECT: UInt64 = 226
+comptime SYS_CLOSE: UInt64 = 57
+comptime SYS_IOCTL: UInt64 = 29
+comptime SYS_GETPID: UInt64 = 172
+comptime SYS_GETPPID: UInt64 = 173
+comptime SYS_UMASK: UInt64 = 166
+comptime SYS_SIGACTION: UInt64 = 134
+comptime SYS_SIGPROCMASK: UInt64 = 135
+comptime SYS_SIGALTSTACK: UInt64 = 132
+comptime SYS_GETRANDOM: UInt64 = 278
+comptime SYS_CLOCK_GETTIME: UInt64 = 113
+comptime SYS_SET_TID_ADDRESS: UInt64 = 96
+
+comptime USER_WINDOW_BASE: Int = 0x41000000
+comptime USER_STACK_SIZE: Int = 0x10000  # 64KB initial user stack
+
+# Linux errno returns, pre-encoded as UInt64 (they come back negative).
+comptime E_NOSYS: UInt64 = 0xFFFFFFFFFFFFFFDA  # -38
+comptime E_INVAL: UInt64 = 0xFFFFFFFFFFFFFFEA  # -22
+comptime E_NOTTY: UInt64 = 0xFFFFFFFFFFFFFFE7  # -25
+comptime E_MEM: UInt64 = 0xFFFFFFFFFFFFFFF4  # -12
+comptime E_NOENT: UInt64 = 0xFFFFFFFFFFFFFFFE  # -2
 
 
 @export("memcpy")
@@ -50,10 +97,6 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
     putc(0x0A)
 
 
-comptime USER_WINDOW_BASE: Int = 0x41000000
-comptime USER_STACK_SIZE: Int = 0x10000  # 64KB initial user stack
-
-
 def _report_memory(mem: MemRegions):
     """Print the RAM regions read from the DTB /memory node."""
     print_str("[mem] ")
@@ -80,23 +123,98 @@ def _setup_allocator(
     ranges the kernel already occupies so it won't hand them out."""
     if mem.n() < 1:
         return False
-    # the running kernel image (text..stack), from boot.S
     alloc.reserve(klo, khi)
     # Reserve the *entire* userspace window -- everything from
-    # USER_WINDOW_BASE up to the top of RAM. Pages there are later granted
-    # EL0 access at 4KB granularity (paging.mojo), so the allocator must
-    # never hand them out for kernel structures; kernel heap and page
-    # tables come from the free RAM below the window instead.
+    # USER_WINDOW_BASE up to the top of RAM -- so the allocator never hands
+    # out frames for kernel structures inside it; pages there are granted
+    # EL0 access at 4KB granularity by paging.mojo on demand.
     if mem.end(0) > UInt64(USER_WINDOW_BASE):
         alloc.reserve(UInt64(USER_WINDOW_BASE), mem.end(0))
-    # the cpio initrd and the DTB image itself (defensive; both already sit
-    # inside the window above, but keep the reservations explicit)
     if bp.has_initrd:
         alloc.reserve(bp.initrd_start, bp.initrd_end)
     if bp.dtb_end > bp.dtb_start:
         alloc.reserve(bp.dtb_start, bp.dtb_end)
     alloc.init(mem.base(0), mem.end(0))
     return True
+
+
+def _sys_brk(addr: Int) -> UInt64:
+    """brk(addr): set/query the program break. Pages between the old and new
+    break are mapped EL0 read/write on demand (no reclaim on shrink)."""
+    var cur = brk_cur()
+    if addr == 0:
+        return UInt64(cur)
+    if addr <= cur:
+        set_brk(addr)
+        return UInt64(addr)
+    # Grow: cap just under the EL0 stack we reserved at the top of RAM.
+    var cap = user_hi() - USER_STACK_SIZE
+    if addr > cap:
+        return E_MEM
+    if not user_map(cur, addr - cur, False):
+        return E_MEM
+    set_brk(addr)
+    return UInt64(addr)
+
+
+def _sys_mmap(addr: Int, length: Int, prot: Int, flags: Int, fd: Int) -> UInt64:
+    """mmap(addr, length, prot, flags, fd, offset): anonymous mappings only.
+
+    Pages are identity-mapped EL0 (read/write, executable if PROT_EXEC).
+    Anonymous regions are carved from the TOP of the user window downward
+    (mmap_next = current top), so they never collide with brk (which grows
+    up from the end of the image) or the EL0 stack at the very top."""
+    if length <= 0:
+        return E_INVAL
+    var anon = (flags & 0x20) != 0
+    if not anon or fd != -1:
+        print_str("[mmap] only MAP_ANONYMOUS (fd=-1) is supported\n")
+        return E_NOSYS
+    var page = 0x1000
+    var nbytes = (length + page - 1) & ~(page - 1)
+    var base = addr
+    if base == 0:
+        base = mmap_next() - nbytes
+    else:
+        base = (base + page - 1) & ~(page - 1)
+    var lo = USER_WINDOW_BASE
+    if base < lo or base + nbytes > mmap_next():
+        return E_MEM
+    var exec = (prot & 1) != 0
+    if not user_map(base, nbytes, exec):
+        return E_MEM
+    set_mmap_next(base)
+    return UInt64(base)
+
+
+def _sys_getrandom(buf: Int, count: Int) -> UInt64:
+    for i in range(count):
+        write_u8(buf + i, 0)
+    return UInt64(count)
+
+
+def _sys_clock_gettime(buf: Int):
+    # { time_t tv_sec; long tv_nsec; } both zero. Avoids crashing callers.
+    var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
+        unsafe_from_address=buf
+    )
+    p[] = 0
+    p[unsafe_offset=1] = 0
+
+
+def _syscall_seen(nr: Int) -> Bool:
+    var word = nr // 64
+    var bit = nr % 64
+    var w = get64(64 + word * 8)
+    return (w & (UInt64(1) << UInt64(bit))) != 0
+
+
+def _syscall_mark(nr: Int):
+    var word = nr // 64
+    var bit = nr % 64
+    var off = 64 + word * 8
+    var w = get64(off)
+    set64(off, w | (UInt64(1) << UInt64(bit)))
 
 
 @export("ksyscall")
@@ -109,34 +227,150 @@ def ksyscall(
     a4: UInt64,
     a5: UInt64,
 ) abi("C") -> UInt64:
-    """Linux syscall dispatcher (arm64 numbers). Called from the EL0 trap.
+    """Linux syscall dispatcher (arm64 numbers); called from the EL0 trap.
 
-    x8 holds the number; args are in x0..x5. For now a minimal subset that
-    our tiny static userspace needs.
+    x8 holds the number; args in x0..x5. Implementations are in this file
+    (and src/kstate.mojo for shared state). Unknown syscalls are logged
+    once and return -ENOSYS so we can discover what a real program needs.
     """
-    _ = a3
-    _ = a4
-    _ = a5
-    # __NR_write = 64: write(fd, buf, count). We ignore fd and write to UART.
-    if n == 64:
+    # write(fd, buf, count) -- every fd prints to the UART for now
+    if n == SYS_WRITE:
         var buf = Int(a1)
         var cnt = Int(a2)
         for i in range(cnt):
             putc(read_u8(buf + i))
         return UInt64(cnt)
-    # __NR_exit = 93 / __NR_exit_group = 94: never return.
-    if n == 93 or n == 94:
+    # read(fd, buf, count) -- nothing to read yet: EOF
+    if n == SYS_READ:
+        return 0
+    # exit / exit_group: never return
+    if n == SYS_EXIT or n == SYS_EXIT_GROUP:
         while True:
             _ = 0
-    # Unsupported: return -ENOSYS (-38).
-    return 0xFFFFFFFFFFFFFFDA
+    if n == SYS_BRK:
+        return _sys_brk(Int(a0))
+    if n == SYS_MMAP:
+        return _sys_mmap(Int(a0), Int(a1), Int(a2), Int(a3), Int(a4))
+    # munmap / mprotect: accepted no-ops (no reclaim of pages yet)
+    if n == SYS_MUNMAP or n == SYS_MPROTECT or n == SYS_CLOSE:
+        return 0
+    if n == SYS_IOCTL:
+        return E_NOTTY  # not a tty; isatty() comes back false
+    if n == SYS_GETPID:
+        return 1  # we are PID 1
+    if n == SYS_GETPPID:
+        return 0
+    if n == SYS_UMASK:
+        return 0
+    # signal APIs: accept and ignore for now
+    if n == SYS_SIGACTION or n == SYS_SIGPROCMASK or n == SYS_SIGALTSTACK:
+        return 0
+    if n == SYS_SET_TID_ADDRESS:
+        return 1
+    if n == SYS_GETRANDOM:
+        return _sys_getrandom(Int(a1), Int(a2))
+    if n == SYS_CLOCK_GETTIME:
+        _sys_clock_gettime(Int(a1))
+        return 0
+    var nr = Int(n)
+    if not _syscall_seen(nr):
+        _syscall_mark(nr)
+        print_str("[sys] unimplemented nr=")
+        print_uint(UInt64(nr), 10)
+        print_str(" a0=0x")
+        print_uint(a0, 16)
+        print_str(" a1=0x")
+        print_uint(a1, 16)
+        putc(0x0A)
+    return E_NOSYS
+
+
+def _copy_lit(addr: Int, lit: StringLiteral):
+    """Copy a string literal (incl. NUL) to user memory at `addr`."""
+    var p = lit.ptr()
+    var i: Int = 0
+    while True:
+        var c = p[unsafe_offset=i]
+        write_u8(addr + i, c)
+        if c == 0:
+            return
+        i += 1
+
+
+def write_u64_word(addr: Int, v: Int):
+    var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    p[] = UInt64(v)
+
+
+def _build_user_stack(top: Int, entry: Int, phdr: Int, phnum: Int) -> Int:
+    """Lay out an initial Linux process stack (argc/argv/envp/auxv) in the
+    mapped stack region just below `top` and return the initial sp.
+
+    argv is fixed for now (["busybox", "echo", ...]) so the same kernel can
+    run either our probe /init or a real static busybox as /init.
+    """
+    var s = (top - 0x300) & ~15
+    # 1) copy argv strings (with NULs) above the arrays
+    var strp = top - 0x200
+    var a0 = strp
+    _copy_lit(a0, "busybox")
+    var a1 = a0 + 8
+    _copy_lit(a1, "echo")
+    var a2 = a1 + 5
+    _copy_lit(a2, "hello from busybox on mojo-os!")
+
+    var rnd = a2 + 31
+    for i in range(16):
+        write_u8(rnd + i, 0)
+
+    # 2) arrays: argc, argv[], NULL, envp NULL, auxv pairs, AT_NULL
+    var p = s
+    write_u64_word(p, 3)  # argc
+    p += 8
+    write_u64_word(p, a0)
+    p += 8
+    write_u64_word(p, a1)
+    p += 8
+    write_u64_word(p, a2)
+    p += 8
+    write_u64_word(p, 0)  # argv terminator
+    p += 8
+    write_u64_word(p, 0)  # envp terminator (no environment yet)
+    p += 8
+    write_u64_word(p, 6)  # AT_PAGESZ
+    p += 8
+    write_u64_word(p, 4096)
+    p += 8
+    write_u64_word(p, 25)  # AT_RANDOM
+    p += 8
+    write_u64_word(p, rnd)
+    p += 8
+    if phdr > 0:
+        write_u64_word(p, 3)  # AT_PHDR
+        p += 8
+        write_u64_word(p, phdr)
+        p += 8
+        write_u64_word(p, 4)  # AT_PHENT
+        p += 8
+        write_u64_word(p, 56)
+        p += 8
+        write_u64_word(p, 5)  # AT_PHNUM
+        p += 8
+        write_u64_word(p, phnum)
+        p += 8
+    write_u64_word(p, 0)  # AT_NULL
+    p += 8
+    write_u64_word(p, 0)
+    return s
 
 
 def _run_user(entry: Int, sp: Int):
     """Drop to EL0 at `entry` with the EL0 stack pointer at `sp`.
 
-    All the pages the image needs must already be mapped with EL0 access
-    (see paging.mojo / elf.mojo); boot.S:run_user just erets.
+    Pages the image needs must already be mapped with EL0 access (see
+    paging.mojo / elf.mojo); boot.S:run_user just erets.
     """
     external_call["run_user", NoneType](entry, sp)
 
@@ -183,34 +417,15 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         else:
             print_str("[cmdline] (none)\n")
 
-    # Report the RAM we learned about from the DTB, then build a physical
-    # allocator over it (reserving everything the kernel already owns) and
-    # exercise alloc/free. This is the memory backend brk/mmap will draw
-    # pages from as we move toward running busybox.
     _report_memory(mem)
     var alloc = PhysAlloc()
     if _setup_allocator(alloc, mem, bp, kernel_lo, kernel_hi):
         print_str("[alloc] total free: 0x")
         print_uint(alloc.free_total(), 16)
         putc(0x0A)
-        var pa = alloc.alloc(64)
-        var pb = alloc.alloc(0x1000)
-        print_str("[alloc] alloc(64)=0x")
-        print_uint(pa, 16)
-        print_str("  alloc(4096)=0x")
-        print_uint(pb, 16)
-        putc(0x0A)
-        alloc.free(pa)
-        alloc.free(pb)
-        print_str("[alloc] after free:  0x")
-        print_uint(alloc.free_total(), 16)
-        putc(0x0A)
     else:
         print_str("[alloc] no RAM region from /memory\n")
 
-    # If QEMU loaded a cpio initrd for us, unpack it into a ramfs and
-    # demonstrate that we can list and look up files in it (the first step
-    # toward exec'ing /init).
     if bp.has_initrd:
         var fs = unpack_cpio(Int(bp.initrd_start), Int(bp.initrd_end))
         print_str("[ramfs] unpacked ")
@@ -223,18 +438,33 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             print_int(idx)
             print_str(" (size=")
             print_uint(UInt64(fs.entry_size(idx)), 10)
-            print_str(", mode=")
-            print_uint(UInt64(fs.entry_mode(idx)), 8)
             print_str(")\n")
 
-            var entry = load_elf(alloc, l2base, fs.data_addr(idx))
-            if entry != 0:
-                # Give the process a stack at the top of RAM: map a window
-                # of pages just below the top of the DTB-reported RAM and
-                # start SP_EL0 there, growing down.
+            var fdata = fs.data_addr(idx)
+            var imgend = elf_image_end(fdata)
+            var phdr = elf_phdrs(fdata)
+            var phnum = Int(read_u16(fdata + 56))
+            var entry = load_elf(alloc, l2base, fdata)
+
+            if entry != 0 and mem.n() >= 1:
+                # Kernel state for the syscall layer: allocator free list +
+                # page table + RAM bounds + user window + brk/mmap cursors.
                 var ram_end = Int(mem.end(0))
+                set64(OFF_FREE_HEAD, alloc.free_head)
+                set64(OFF_RAM_BASE, mem.base(0))
+                set64(OFF_RAM_END, mem.end(0))
+                set64(OFF_L2, UInt64(l2base))
+                set64(OFF_USER_BASE, UInt64(USER_WINDOW_BASE))
+                set64(OFF_USER_HI, mem.end(0))
+                var heap_base = (imgend + 0xFFFF) & ~0xFFFF
+                set_brk(heap_base)
+
+                # EL0 stack at the very top of RAM, growing down.
                 var stack_top = ram_end & ~15
                 var stack_base = stack_top - USER_STACK_SIZE
+                # Anonymous mmaps are carved top-down from just below the
+                # stack so they can never collide with brk's upward growth.
+                set_mmap_next(stack_base)
                 if map_user_region(
                     alloc, l2base, stack_base, USER_STACK_SIZE, False
                 ):
@@ -245,10 +475,16 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
                     print_str(")\n")
                 else:
                     print_str("[user] stack mapping failed\n")
+                print_str("[user] brk base=0x")
+                print_uint(UInt64(heap_base), 16)
+                print_str(" phdr=0x")
+                print_uint(UInt64(phdr), 16)
+                print_str("\n")
+                var sp = _build_user_stack(stack_top, entry, phdr, phnum)
                 print_str("[user] entry=0x")
                 print_uint(UInt64(entry), 16)
                 print_str("\n[user] dropping to EL0...\n")
-                _run_user(entry, stack_top)
+                _run_user(entry, sp)
             else:
                 print_str("[elf] failed to load /init\n")
         else:

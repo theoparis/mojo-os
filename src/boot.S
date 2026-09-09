@@ -426,6 +426,13 @@ flush_tlb_all:
     isb
     ret
 
+// kstate_ptr: returns the address of the kernel-state area (see linker.ld
+// __kstate) in x0. Called from Mojo (kstate.mojo).
+.global kstate_ptr
+kstate_ptr:
+    ldr     x0, =__kstate
+    ret
+
 // uart_putc: character (zero-extended) in w0. Clobbers x1-x2.
 uart_putc:
     ldr     x1, =UART_BASE

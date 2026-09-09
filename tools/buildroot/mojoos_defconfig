@@ -1,0 +1,30 @@
+# mojo-os userspace configuration for Buildroot.
+#
+# Produces a *static musl* aarch64 busybox (plus any other userland we ask
+# for) that our kernel can exec. Kernel itself is NOT built here (mojo-os
+# has its own); rootfs assembly is skipped (BR2_INIT_NONE) -- we harvest
+# binaries out of target/ or build/ and pack our own cpio initrd.
+#
+# Usage (see Makefile targets once wired up):
+#   make -C work/buildroot O=<outdir> mojoos_defconfig
+#   make -C work/buildroot O=<outdir> busybox
+#   # binary lands in <outdir>/build/busybox-*/busybox (static)
+#
+# Target: aarch64
+BR2_aarch64=y
+BR2_cortex_a57=y
+
+# Toolchain: buildroot's own, with musl, fully static userland
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_STATIC_LIBS=y
+
+# No init system / bootloader / kernel -- we only want userspace packages
+BR2_INIT_NONE=y
+BR2_PACKAGE_BUSYBOX=y
+
+# Skip building a kernel image
+# (BR2_LINUX_KERNEL is unset by default)
+
+# Extra userland we may later want for a usable root filesystem:
+# BR2_PACKAGE_DROPBEAR=y
+# BR2_PACKAGE_TOYBOX=y

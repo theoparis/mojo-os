@@ -39,6 +39,53 @@ def elf_is_valid(base: Int) -> Bool:
     return True
 
 
+def elf_phdrs(base: Int) -> Int:
+    """Virtual address of the program-header table in the loaded image, or
+    0 if the headers are not covered by any PT_LOAD segment (then we can't
+    hand out AT_PHDR). Linux links static binaries with LOAD #1 at file
+    offset 0, so this normally succeeds."""
+    if not elf_is_valid(base):
+        return 0
+    var phoff = Int(read_u64(base + 32))
+    var phentsize = Int(read_u16(base + 54))
+    var phnum = Int(read_u16(base + 56))
+    var i = 0
+    while i < phnum:
+        var ph = base + phoff + i * phentsize
+        if read_u32(ph + 0) == PT_LOAD:
+            var p_offset = Int(read_u64(ph + 8))
+            var p_vaddr = Int(read_u64(ph + 16))
+            var p_filesz = Int(read_u64(ph + 32))
+            if (
+                phoff >= p_offset
+                and phoff + phnum * phentsize <= p_offset + p_filesz
+            ):
+                return p_vaddr + (phoff - p_offset)
+        i += 1
+    return 0
+
+
+def elf_image_end(base: Int) -> Int:
+    """Highest byte past the last PT_LOAD (p_vaddr + p_memsz), 0 if none."""
+    if not elf_is_valid(base):
+        return 0
+    var phoff = Int(read_u64(base + 32))
+    var phentsize = Int(read_u16(base + 54))
+    var phnum = Int(read_u16(base + 56))
+    var end: Int = 0
+    var i = 0
+    while i < phnum:
+        var ph = base + phoff + i * phentsize
+        if read_u32(ph + 0) == PT_LOAD:
+            var p_vaddr = Int(read_u64(ph + 16))
+            var p_memsz = Int(read_u64(ph + 40))
+            var e = p_vaddr + p_memsz
+            if e > end:
+                end = e
+        i += 1
+    return end
+
+
 def load_elf(mut alloc: PhysAlloc, l2: Int, base: Int) -> Int:
     """Map and load the ELF64/AArch64 image at `base` into the user window.
 
