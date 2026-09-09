@@ -36,6 +36,30 @@ PAGE_SHIFT selects the translation granule (12 = 4KB default, 14 = 16KB)
 and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
 (phys.mojo/paging.mojo). See docs/16k-pages.md.
 
+## Filesystem & busybox
+
+The kernel mounts the cpio initrd as a small read-only VFS (src/vfs.mojo) and
+serves it to userspace through real file syscalls: `openat`, `close`, `read`,
+`write`/`writev` (stdout → UART), `lseek`, `fstat`, `newfstatat`, `getcwd`,
+`getdents64`, plus identity syscalls (uid/gid 0). A static musl busybox as
+`/init` can then walk the filesystem. argv[1..] for the applet comes from the
+DTB cmdline (anything that isn't a boot parameter), defaulting to
+`busybox echo`:
+
+```sh
+# run real busybox over the VFS
+make run-linux                 # default: busybox echo ...
+qemu-system-aarch64 -M virt -cpu cortex-a57 -nographic \
+  -kernel build/kernel.bin -initrd build/bb.cpio \
+  -append 'console=ttyAMA0 rdinit=/init ls /'        # list /
+  # ... 'cat /hello.txt' prints a file
+```
+
+The VFS is exercised directly by src/user/vfstest.c (open/read/lseek/stat/
+getdents on an initrd with extra files). The filesystem is intentionally flat
+(root dir only) for now -- subdirectories, writes, and a real mount layer are
+future work.
+
 ## Source layout
 
 | path | purpose |
@@ -47,6 +71,7 @@ and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
 | `src/dtb.mojo` | device-tree parser: `/chosen` (initrd + cmdline) and `/memory` (RAM ranges) |
 | `src/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
 | `src/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
+| `src/vfs.mojo` | minimal VFS over the initrd (flat read-only rootfs) + the fd table and file syscall primitives |
 | `src/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
 | `src/paging.mojo` | real user VA space (low 128MB, VA≠PA): PAGE_SHIFT selects the 4KB/16KB granule; lazily-created leaf tables, per-page EL0 perms, frames from the allocator |
 | `src/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |

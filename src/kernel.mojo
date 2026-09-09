@@ -31,11 +31,26 @@ from kstate import (
     set_brk,
     set_mmap_next,
     user_map,
+    vfs,
+    set_vfs,
 )
-from mem import read_u16, read_u8, write_u8
+from mem import read_u16, read_u64, read_u8, write_u64, write_u8
 from paging import USER_VA_TOP, init_user_vm, map_user
 from phys import PAGE_SIZE, PhysAlloc
 from ramfs import unpack_cpio
+from vfs import (
+    add_file as vfs_add,
+    close as vfs_close,
+    fstat as vfs_fstat,
+    getdents as vfs_getdents,
+    lseek as vfs_lseek,
+    mount as vfs_mount,
+    open as vfs_open,
+    read as vfs_read,
+    resolve as vfs_resolve,
+    stat_path as vfs_stat,
+    stat_stdio as vfs_stat_stdio,
+)
 
 # aarch64 Linux syscall numbers we implement or recognize
 comptime SYS_WRITE: UInt64 = 64
@@ -58,6 +73,23 @@ comptime SYS_GETRANDOM: UInt64 = 278
 comptime SYS_CLOCK_GETTIME: UInt64 = 113
 comptime SYS_SET_TID_ADDRESS: UInt64 = 96
 
+# file / fs / identity syscalls served by the VFS (aarch64 numbers)
+comptime SYS_FCNTL: UInt64 = 25
+comptime SYS_WRITEV: UInt64 = 66
+comptime SYS_GETCWD: UInt64 = 17
+comptime SYS_FACCESSAT: UInt64 = 48
+comptime SYS_CHDIR: UInt64 = 49
+comptime SYS_OPENAT: UInt64 = 56
+comptime SYS_GETDENTS64: UInt64 = 61
+comptime SYS_LSEEK: UInt64 = 62
+comptime SYS_NEWFSTATAT: UInt64 = 79
+comptime SYS_FSTAT: UInt64 = 80
+comptime SYS_GETUID: UInt64 = 174
+comptime SYS_GETEUID: UInt64 = 175
+comptime SYS_GETGID: UInt64 = 176
+comptime SYS_GETEGID: UInt64 = 177
+comptime SYS_UNAME: UInt64 = 160
+
 # Userspace lives in the low 128MB VA space carved out of L1[0] by
 # paging.mojo (user VA != PA). The EL0 stack sits at its very top
 # (0x08000000 down) and anonymous mmaps descend from just below it. brk
@@ -72,6 +104,8 @@ comptime E_INVAL: UInt64 = 0xFFFFFFFFFFFFFFEA  # -22
 comptime E_NOTTY: UInt64 = 0xFFFFFFFFFFFFFFE7  # -25
 comptime E_MEM: UInt64 = 0xFFFFFFFFFFFFFFF4  # -12
 comptime E_NOENT: UInt64 = 0xFFFFFFFFFFFFFFFE  # -2
+comptime E_BADF: UInt64 = 0xFFFFFFFFFFFFFFF7  # -9
+comptime E_ROFS: UInt64 = 0xFFFFFFFFFFFFFFE2  # -30
 
 
 @export("memcpy")
@@ -250,16 +284,34 @@ def ksyscall(
     (and src/kstate.mojo for shared state). Unknown syscalls are logged
     once and return -ENOSYS so we can discover what a real program needs.
     """
-    # write(fd, buf, count) -- every fd prints to the UART for now
+    var vb = vfs()  # persistent VFS base (0 if the initrd wasn't mounted)
+
+    # write(fd, buf, count): fd 0/1/2 go to the UART console.
     if n == SYS_WRITE:
-        var buf = Int(a1)
-        var cnt = Int(a2)
-        for i in range(cnt):
-            putc(read_u8(buf + i))
-        return UInt64(cnt)
-    # read(fd, buf, count) -- nothing to read yet: EOF
+        var fdw = Int(a0)
+        if fdw == 0 or fdw == 1 or fdw == 2:
+            var buf = Int(a1)
+            var cnt = Int(a2)
+            for i in range(cnt):
+                putc(read_u8(buf + i))
+            return UInt64(cnt)
+        return E_ROFS  # the ramfs is read-only
+    # read(fd, buf, count): stdin is empty (EOF); files come from the VFS.
     if n == SYS_READ:
-        return 0
+        var fdr = Int(a0)
+        if fdr < 3:
+            return 0  # EOF on stdin
+        if vb == 0:
+            return E_BADF
+        return vfs_read(vb, fdr, Int(a1), Int(a2))
+    # close(fd): never close stdio.
+    if n == SYS_CLOSE:
+        var fdc = Int(a0)
+        if fdc < 3:
+            return 0
+        if vb == 0:
+            return E_BADF
+        return vfs_close(vb, fdc)
     # exit / exit_group: never return
     if n == SYS_EXIT or n == SYS_EXIT_GROUP:
         while True:
@@ -269,7 +321,79 @@ def ksyscall(
     if n == SYS_MMAP:
         return _sys_mmap(Int(a0), Int(a1), Int(a2), Int(a3), Int(a4))
     # munmap / mprotect: accepted no-ops (no reclaim of pages yet)
-    if n == SYS_MUNMAP or n == SYS_MPROTECT or n == SYS_CLOSE:
+    if n == SYS_MUNMAP or n == SYS_MPROTECT:
+        return 0
+    if n == SYS_OPENAT:
+        if vb == 0:
+            return E_NOENT
+        return vfs_open(vb, Int(a1), Int(a2))
+    if n == SYS_LSEEK:
+        if vb == 0:
+            return E_BADF
+        return vfs_lseek(vb, Int(a0), Int(a1), Int(a2))
+    if n == SYS_GETDENTS64:
+        if vb == 0:
+            return E_BADF
+        return vfs_getdents(vb, Int(a0), Int(a1), Int(a2))
+    if n == SYS_FSTAT:
+        if Int(a0) < 3:
+            vfs_stat_stdio(Int(a1))
+            return 0
+        if vb == 0:
+            return E_BADF
+        return vfs_fstat(vb, Int(a0), Int(a1))
+    if n == SYS_NEWFSTATAT:
+        if vb == 0:
+            return E_NOENT
+        return vfs_stat(vb, Int(a1), Int(a2))
+    if n == SYS_GETCWD:
+        if Int(a1) < 2:
+            return E_INVAL
+        write_u8(Int(a0), 0x2F)  # '/'
+        write_u8(Int(a0) + 1, 0)
+        return 2
+    if n == SYS_CHDIR:
+        return 0  # root-only cwd for now
+    # fcntl(fd, cmd, arg): satisfy the flag query/clear cmds busybox uses.
+    if n == SYS_FCNTL:
+        var fcmd = Int(a1)
+        if fcmd == 1 or fcmd == 2 or fcmd == 4:  # F_GETFD/F_SETFD/F_SETFL
+            return 0
+        if fcmd == 3:  # F_GETFL -> O_RDONLY
+            return 0
+        return E_INVAL
+    # writev(fd, iov, count): gather the iovecs; stdout/stderr -> UART.
+    if n == SYS_WRITEV:
+        var wfd = Int(a0)
+        var iov = Int(a1)
+        var cnt = Int(a2)
+        var total: Int = 0
+        var toconsole = (wfd == 0 or wfd == 1 or wfd == 2)
+        for k in range(cnt):
+            var base = Int(read_u64(iov + k * 16))
+            var len = Int(read_u64(iov + k * 16 + 8))
+            total += len
+            if toconsole:
+                for i in range(len):
+                    putc(read_u8(base + i))
+        return UInt64(total)
+    if n == SYS_FACCESSAT:
+        if vb == 0:
+            return E_NOENT
+        var o = vfs_open(vb, Int(a1), 0)
+        if o < 3:
+            return o  # propagate -errno
+        return vfs_close(vb, Int(o))
+    # identity: we run everything as root (uid/gid 0)
+    if (
+        n == SYS_GETUID
+        or n == SYS_GETEUID
+        or n == SYS_GETGID
+        or n == SYS_GETEGID
+    ):
+        return 0
+    if n == SYS_UNAME:
+        _sys_uname(Int(a0))
         return 0
     if n == SYS_IOCTL:
         return E_NOTTY  # not a tty; isatty() comes back false
@@ -314,6 +438,16 @@ def _copy_lit(addr: Int, lit: StringLiteral):
         i += 1
 
 
+def _sys_uname(buf: Int):
+    """uname: fill a Linux struct utsname (6 x char[65], 390 bytes)."""
+    _copy_lit(buf + 0, "mojo-os")  # sysname
+    _copy_lit(buf + 65, "mojo-os")  # nodename
+    _copy_lit(buf + 130, "1.0.0")  # release
+    _copy_lit(buf + 195, "mojo-os 1.0.0")  # version
+    _copy_lit(buf + 260, "aarch64")  # machine
+    _copy_lit(buf + 325, "(none)")  # domainname
+
+
 def write_u64_word(addr: Int, v: Int):
     var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
         unsafe_from_address=addr
@@ -321,37 +455,145 @@ def write_u64_word(addr: Int, v: Int):
     p[] = UInt64(v)
 
 
-def _build_user_stack(top: Int, entry: Int, phdr: Int, phnum: Int) -> Int:
+comptime MAX_ARGV = 16
+
+
+def _nul_len(addr: Int) -> Int:
+    """Bytes of a NUL-terminated string at `addr`, including the NUL."""
+    var i: Int = 0
+    while read_u8(addr + i) != 0:
+        i += 1
+    return i + 1
+
+
+def _cmp_word(w: Int, wlen: Int, lit: StringLiteral, want_exact: Bool) -> Bool:
+    """Compare a cmdline word to a literal (prefix or exact match)."""
+    var p = lit.ptr()
+    var i: Int = 0
+    while p[unsafe_offset=i] != 0:
+        if i >= wlen:
+            return False
+        if read_u8(w + i) != p[unsafe_offset=i]:
+            return False
+        i += 1
+    if want_exact:
+        return i == wlen
+    return True  # word starts with the literal
+
+
+def _is_boot_word(w: Int, wlen: Int) -> Bool:
+    """True if `w` is a kernel boot parameter (consumed, not passed on)."""
+    if _cmp_word(w, wlen, "quiet", True) or _cmp_word(w, wlen, "rw", True):
+        return True
+    if _cmp_word(w, wlen, "ro", True) or _cmp_word(w, wlen, "nosmp", True):
+        return True
+    if _cmp_word(w, wlen, "console=", False):
+        return True
+    if _cmp_word(w, wlen, "rdinit=", False):
+        return True
+    if _cmp_word(w, wlen, "init=", False):
+        return True
+    if _cmp_word(w, wlen, "root=", False):
+        return True
+    if _cmp_word(w, wlen, "earlycon=", False):
+        return True
+    if _cmp_word(w, wlen, "loglevel=", False):
+        return True
+    return False
+
+
+def _collect_argv(scr: Int, cmd: Int, cmdlen: Int) -> Int:
+    """Build the argv list into the kernel scratch region `scr` and return
+    argc. Region layout:
+      scr+0          u64 argc
+      scr+8          u64 argv[N] (kernel addrs of NUL strings)
+      scr+8+8*MAX    string bytes
+    argv[0] is always "busybox"; argv[1..] come from non-boot tokens on the
+    DTB cmdline, or default to busybox "echo ..." when there are none."""
+    var strp = scr + 8 + MAX_ARGV * 8
+    # argv[0] = "busybox"
+    _copy_lit(strp, "busybox")
+    write_u64(scr + 8, UInt64(strp))
+    strp += _nul_len(strp)
+    var argc = 1
+
+    if cmd != 0 and cmdlen > 0:
+        var i: Int = 0
+        while i < cmdlen:
+            while i < cmdlen:
+                var b = read_u8(cmd + i)
+                if b != 0x20 and b != 0x09:  # not space / tab
+                    break
+                i += 1
+            var ws = i
+            while i < cmdlen:
+                var b = read_u8(cmd + i)
+                if b == 0x20 or b == 0x09:
+                    break
+                i += 1
+            var wlen = i - ws
+            if wlen > 0 and not _is_boot_word(cmd + ws, wlen):
+                if argc >= MAX_ARGV:
+                    break
+                for j in range(wlen):
+                    write_u8(strp + j, read_u8(cmd + ws + j))
+                write_u8(strp + wlen, 0)
+                write_u64(scr + 8 + argc * 8, UInt64(strp))
+                strp += wlen + 1
+                argc += 1
+
+    if argc == 1:  # no app args on the cmdline: default busybox echo
+        _copy_lit(strp, "echo")
+        write_u64(scr + 8 + argc * 8, UInt64(strp))
+        strp += _nul_len(strp)
+        argc += 1
+        _copy_lit(strp, "hello from busybox on mojo-os!")
+        write_u64(scr + 8 + argc * 8, UInt64(strp))
+        strp += _nul_len(strp)
+        argc += 1
+    write_u64(scr, UInt64(argc))
+    return argc
+
+
+def _build_user_stack(
+    top: Int, entry: Int, phdr: Int, phnum: Int, argc: Int, argaddrs: Int
+) -> Int:
     """Lay out an initial Linux process stack (argc/argv/envp/auxv) in the
     mapped stack region just below `top` and return the initial sp.
 
-    argv is fixed for now (["busybox", "echo", ...]) so the same kernel can
-    run either our probe /init or a real static busybox as /init.
+    `argc` argv strings (each NUL-terminated) are copied out of the kernel
+    argv list at `argaddrs` (an array of `argc` u64 kernel addresses, as
+    built by _collect_argv) into the user stack region.
     """
     var s = (top - 0x300) & ~15
-    # 1) copy argv strings (with NULs) above the arrays
+    # 1) copy each argv string (kernel -> user), remembering the user addrs
     var strp = top - 0x200
-    var a0 = strp
-    _copy_lit(a0, "busybox")
-    var a1 = a0 + 8
-    _copy_lit(a1, "echo")
-    var a2 = a1 + 5
-    _copy_lit(a2, "hello from busybox on mojo-os!")
-
-    var rnd = a2 + 31
+    var uaddrs = Array[Int, MAX_ARGV](uninitialized=True)
+    for i in range(argc):
+        var src = Int(read_u64(argaddrs + i * 8))
+        var d = strp
+        while True:
+            var b = read_u8(src)
+            write_u8(d, b)
+            d += 1
+            src += 1
+            if b == 0:
+                break
+        uaddrs[i] = strp
+        strp = d
+    # AT_RANDOM: 16 zero bytes right after the strings
     for i in range(16):
-        write_u8(rnd + i, 0)
+        write_u8(strp + i, 0)
+    var rnd = strp
+    strp += 16
 
-    # 2) arrays: argc, argv[], NULL, envp NULL, auxv pairs, AT_NULL
+    # 2) arrays from s: argc, argv[], NULL, envp NULL, auxv pairs, AT_NULL
     var p = s
-    write_u64_word(p, 3)  # argc
+    write_u64_word(p, argc)
     p += 8
-    write_u64_word(p, a0)
-    p += 8
-    write_u64_word(p, a1)
-    p += 8
-    write_u64_word(p, a2)
-    p += 8
+    for i in range(argc):
+        write_u64_word(p, uaddrs[i])
+        p += 8
     write_u64_word(p, 0)  # argv terminator
     p += 8
     write_u64_word(p, 0)  # envp terminator (no environment yet)
@@ -453,6 +695,39 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         print_uint(UInt64(fs.total()), 10)
         print_str(" file(s)\n")
         fs.list()
+
+        # Mount the initrd as the persistent VFS for the file syscalls. The
+        # region is allocated (never freed) and its address saved to kernel
+        # state before we snapshot the allocator free-list head below.
+        var vbase = alloc.alloc_pages(1)
+        if vbase != 0:
+            vfs_mount(Int(vbase))
+            var mounted = 0
+            for i in range(fs.total()):
+                if vfs_add(
+                    Int(vbase),
+                    fs.name_addr(i),
+                    fs.data_addr(i),
+                    fs.entry_size(i),
+                    UInt64(fs.entry_mode(i)),
+                ):
+                    mounted += 1
+            set_vfs(Int(vbase))
+            print_str("[vfs] mounted ")
+            print_uint(UInt64(mounted), 10)
+            print_str(" file(s) @0x")
+            print_uint(vbase, 16)
+            putc(0x0A)
+        else:
+            print_str("[vfs] alloc failed, files disabled\n")
+
+        # A stable kernel scratch buffer for building the user argv list
+        # (from the DTB cmdline). Allocated before the allocator snapshot so
+        # syscall-time free-list re-attach doesn't reuse it.
+        var argscr = alloc.alloc_pages(1)
+        if argscr == 0:
+            print_str("[argv] scratch alloc failed\n")
+
         var idx = fs.lookup("/init")
         if idx >= 0:
             print_str('[ramfs] lookup "/init" -> entry ')
@@ -501,7 +776,12 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
                 print_str(" phdr=0x")
                 print_uint(UInt64(phdr), 16)
                 print_str("\n")
-                var sp = _build_user_stack(stack_top, entry, phdr, phnum)
+                var argc = _collect_argv(
+                    Int(argscr), bp.cmdline_addr, bp.cmdline_len
+                )
+                var sp = _build_user_stack(
+                    stack_top, entry, phdr, phnum, argc, Int(argscr) + 8
+                )
                 print_str("[user] entry=0x")
                 print_uint(UInt64(entry), 16)
                 print_str("\n[user] dropping to EL0...\n")

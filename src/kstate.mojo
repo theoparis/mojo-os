@@ -11,6 +11,7 @@
 #   40  next anonymous mmap address
 #   48  user window base / 56 high end
 #   64..92  bitmap of syscall numbers already reported as unimplemented
+#   96   base address of the persistent VFS region (src/vfs.mojo)
 from std.ffi import external_call
 
 from mem import read_u64, write_u64
@@ -26,6 +27,7 @@ comptime OFF_MMAP: Int = 40
 comptime OFF_USER_BASE: Int = 48
 comptime OFF_USER_HI: Int = 56
 comptime OFF_TRACE: Int = 64
+comptime OFF_VFS: Int = 96
 
 
 def base() -> Int:
@@ -79,6 +81,15 @@ def set_mmap_next(v: Int):
 
 def user_hi() -> Int:
     return Int(get64(OFF_USER_HI))
+
+
+def vfs() -> Int:
+    """Base address of the persistent VFS region, or 0 if not mounted."""
+    return Int(get64(OFF_VFS))
+
+
+def set_vfs(v: Int):
+    set64(OFF_VFS, UInt64(v))
 
 
 def user_map(va: Int, size: Int, exec: Bool) -> Bool:
