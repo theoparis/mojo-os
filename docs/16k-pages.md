@@ -1,10 +1,10 @@
 # Supporting 16KB pages (granule) on mojo-os
 
-This documents what switching the kernel's MMU from the current **4KB page
-granule** to a **16KB granule** would take. It is an analysis/design note,
-not yet implemented. All page-size-dependent code in this tree is marked
-with comments saying so; grepping for `4096`, `0x200000`, `512`, `>> 12`,
-`<< 21` and `ALIGN(4096)` finds most of it.
+> **Status: implemented.** The kernel now boots on the 16KB granule
+> (PAGE_SHIFT=14 in src/phys.mojo; TCR TG0=0b10; boot.S builds a single top
+> table indexed by VA[31:25] with lazily-created 2048-entry leaf tables;
+> QEMU needs `-cpu cortex-a76` or `max`). The rest of this document records
+> the analysis that drove the change.
 
 ## Translation granule background
 

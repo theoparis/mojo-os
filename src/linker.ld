@@ -41,22 +41,16 @@ SECTIONS
     }
     __bss_end = .;
 
-    /* A single 4KB, 512-entry level-1 translation table (4KB granule,
-     * T0SZ=32 => 4GB VA space => level-1 block descriptors cover 1GB each).
-     * Zeroed by hand in boot.S (all-zero entries are simply invalid, which
-     * is what we want for the unused slots). */
-    . = ALIGN(4096);
+    /* The single top-level translation table for the 16KB granule: 2048 x
+     * 8B descriptors = 16KB. With T0SZ=32 (4GB VA) the 16KB-granule walk
+     * uses two levels, and this top table is indexed by VA[31:25]; each
+     * entry is either a 32MB block descriptor (devices/RAM, identity) or a
+     * pointer to a lazily-created 2048-entry leaf table for userspace pages
+     * (see src/paging.mojo). Zeroed + filled by boot.S. Must be 16KB
+     * aligned for TTBR0. */
+    . = ALIGN(0x4000);
     __page_table = .;
-    . += 4096;
-
-    /* Level-2 table (512 x 2MB entries) covering the 1GB RAM range
-     * (0x40000000-0x80000000). This is the kernel's identity RAM map --
-     * L1[1] points here and all entries are Normal, EL1-only 2MB blocks.
-     * Userspace pages do NOT live here: they get their own low-VA table
-     * (L2-A) hung under L1[0] by src/paging.mojo. */
-    . = ALIGN(4096);
-    __page_table_l2 = .;
-    . += 4096;
+    . += 0x4000;
 
     /* Reserve a stack region for EL1 (grows downward from __stack_top).
      * QEMU's -M virt places RAM at 0x40000000 (default 128 MiB), so this

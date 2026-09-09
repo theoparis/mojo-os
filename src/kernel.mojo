@@ -33,8 +33,8 @@ from kstate import (
     user_map,
 )
 from mem import read_u16, read_u8, write_u8
-from paging import USER_VA_TOP, init_user_vm, map_user
-from phys import PhysAlloc
+from paging import USER_VA_TOP, map_user
+from phys import PAGE_SIZE, PhysAlloc
 from ramfs import unpack_cpio
 
 # aarch64 Linux syscall numbers we implement or recognize
@@ -184,7 +184,7 @@ def _sys_mmap(addr: Int, length: Int, prot: Int, flags: Int, fd: Int) -> UInt64:
     if not anon or fd != -1:
         print_str("[mmap] only MAP_ANONYMOUS (fd=-1) is supported\n")
         return E_NOSYS
-    var page = 0x1000
+    var page = PAGE_SIZE
     var nbytes = (length + page - 1) & ~(page - 1)
     var fixed = (flags & 0x10) != 0  # MAP_FIXED
     var base: Int
@@ -358,7 +358,7 @@ def _build_user_stack(top: Int, entry: Int, phdr: Int, phnum: Int) -> Int:
     p += 8
     write_u64_word(p, 6)  # AT_PAGESZ
     p += 8
-    write_u64_word(p, 4096)
+    write_u64_word(p, PAGE_SIZE)
     p += 8
     write_u64_word(p, 25)  # AT_RANDOM
     p += 8
@@ -440,9 +440,6 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         print_str("[alloc] total free: 0x")
         print_uint(alloc.free_total(), 16)
         putc(0x0A)
-        # Carve the low 128MB out of L1[0] as a real user VA space.
-        if not init_user_vm(alloc, l1base):
-            print_str("[paging] init_user_vm failed\n")
     else:
         print_str("[alloc] no RAM region from /memory\n")
 

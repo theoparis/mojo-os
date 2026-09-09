@@ -26,6 +26,15 @@ comptime PH_ALIGN: Int = 16
 comptime PH_MIN_BLOCK: Int = PH_HDR + PH_ALIGN
 comptime PH_RES_MAX: Int = 16
 
+# Page geometry (16KB translation granule). PAGE_SHIFT selects the granule
+# the whole kernel is built for; boot.S (TCR TG0 + table sizes/loops) and
+# src/paging.mojo must match, and QEMU needs a CPU that implements the 16KB
+# granule (cortex-a76/max). Reverting to PAGE_SHIFT=12 (4KB) requires the
+# matching boot.S table geometry (see docs/16k-pages.md).
+comptime PAGE_SHIFT: Int = 14
+comptime PAGE_SIZE: Int = 1 << PAGE_SHIFT  # 16384
+comptime PAGE_MASK: Int = PAGE_SIZE - 1
+
 
 @always_inline
 def _a16(v: UInt64) -> UInt64:
@@ -156,20 +165,22 @@ struct PhysAlloc:
         return 0
 
     def alloc_pages(mut self, npages: Int) -> UInt64:
-        """Return a 4KB-aligned, physically contiguous frame of `npages` pages.
+        """Return a PAGE_SIZE-aligned, physically contiguous frame of `npages`
+        pages.
 
         The free-list allocator is 16-byte aligned, so we over-allocate by
-        one page and round the returned payload up to a 4KB boundary (the
-        rounded-up prefix is wasted on purpose). These frames are used for
-        kernel page tables (never freed), so there is deliberately no
-        matching free.
+        one page and round the returned payload up to a PAGE_SIZE boundary
+        (the rounded-up prefix is wasted on purpose). These frames back
+        user pages and 16KB page tables, and are never freed, so there is
+        deliberately no matching free.
         """
         if npages <= 0:
             return 0
-        var raw = self.alloc(npages * 4096 + 4096)
+        var raw = self.alloc(npages * PAGE_SIZE + PAGE_SIZE)
         if raw == 0:
             return 0
-        return (raw + UInt64(4095)) & 0xFFFFFFFFFFFFF000
+        var ps = UInt64(PAGE_SIZE)
+        return (raw + (ps - 1)) & ~(ps - 1)
 
     def free(mut self, addr: UInt64):
         """Return a block previously handed out by `alloc` to the free list."""

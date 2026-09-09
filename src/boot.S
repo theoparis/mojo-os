@@ -58,6 +58,15 @@ _start:
     msr     cpacr_el1, x0
     isb
 
+    // This kernel is built for the 16KB translation granule (TCR TG0=0b10
+    // below). Verify the CPU implements it (ID_AA64MMFR0_EL1.TGran16, bits
+    // [23:20], != 0) before switching the MMU on, else the first
+    // translation faults silently. (cortex-a57 lacks it; use cortex-a76.)
+    mrs     x0, id_aa64mmfr0_el1
+    lsr     x0, x0, #20
+    and     x0, x0, #0xF
+    cbz     x0, .Lno_tgran16
+
     bl      setup_mmu
 
 .Ljump_kernel:
@@ -73,6 +82,10 @@ _start:
     bl      kmain
 
 // Fail-safe catch loop
+.Lno_tgran16:
+    adr     x0, msg_no_tgran16
+    bl      uart_puts
+    b       .Ldeadloop
 .Ldeadloop:
     wfi
     b       .Ldeadloop
@@ -99,7 +112,7 @@ _start:
 .equ MAIR_DEVICE_IDX,  1
 .equ MAIR_VALUE,       0x00000000000000FF  // idx0=Normal WB RW-alloc, idx1=Device-nGnRnE(0)
 
-.equ TCR_VALUE,        0x0000000000803520  // T0SZ=32, IRGN0/ORGN0=WB, SH0=Inner, EPD1=1
+.equ TCR_VALUE,        0x000000000080B520  // TG0=0b10 (16KB), T0SZ=32, IRGN0/ORGN0=WB, SH0=Inner, EPD1=1
 
 .equ DESC_AF,          (1 << 10)
 .equ DESC_SH_INNER,    (3 << 8)
@@ -108,19 +121,25 @@ _start:
 .equ DESC_UXN,         (1 << 54)
 .equ DESC_PXN,         (1 << 53)
 
-// No EL0 access is granted at boot: the whole RAM range is mapped EL1-only
-// with 2MB blocks. Userspace instead gets a *real* virtual address space in
-// the low 128MB (see src/paging.mojo): kmain repoints L1[0] at a level-2
-// table whose low slots are filled lazily with level-3 user pages (each L3
-// entry carries its own AP/UXN), so user code/data live at ordinary link
-// addresses (e.g. 0x400000) mapped onto physical frames -- VA != PA.
+// 16KB translation-granule geometry. A 16KB table holds 2048 8-byte
+// descriptors and is 16KB; with T0SZ=32 (4GB VA) the walk uses two levels:
+// this top table is indexed by VA[31:25] (each entry covers 32MB) and
+// points at lazily-created 2048-entry leaf tables (page index VA[24:14],
+// each covering 32MB).
+.equ TG_INDEX_SHIFT,   25      // top-table entry index = VA[31:25]
+.equ TG_TOP_SLOTS,     128     // entries used for a 4GB (32-bit) VA space
 
+// No EL0 access is granted at boot: everything is EL1-only. The top table's
+// low slots (VA[0..0x08000000), TG slots 0..3) are left unmapped -- that is
+// the real userspace VA space, filled lazily with leaf (user) pages by
+// src/paging.mojo (VA != PA). Device slots and RAM slots are 32MB identity
+// blocks, all EL1-only.
 setup_mmu:
     stp     x30, x21, [sp, #-16]!
 
-    // Zero the page table (all-zero entries are invalid, our safe default).
+    // Zero the whole top table (2048 entries = 16KB; all-zero = invalid).
     ldr     x0, =__page_table
-    mov     x1, #4096
+    mov     x1, #(2048 * 8)
     add     x1, x0, x1
 .Lpt_zero:
     cmp     x0, x1
@@ -131,68 +150,39 @@ setup_mmu:
 
     ldr     x21, =__page_table
 
-    // Entry 0: 0x00000000, Device-nGnRnE, non-executable.
-    mov     x0, #0
+    // Device slots: TG slots 4..31 cover VAs [0x08000000, 0x40000000) in
+    // 32MB identity blocks (UART 0x09000000, GIC 0x08000000, ...). Slots
+    // 0..3 are left unmapped: they are the userspace VA space.
+    mov     x2, #4
+.Ldev_loop:
+    cmp     x2, #32
+    b.ge    .Ldev_done
+    lsl     x0, x2, #TG_INDEX_SHIFT
     orr     x0, x0, #(MAIR_DEVICE_IDX << 2)
     orr     x0, x0, #DESC_AF
     orr     x0, x0, #DESC_BLOCK
     orr     x0, x0, #DESC_UXN
     orr     x0, x0, #DESC_PXN
-    str     x0, [x21, #0]
+    str     x0, [x21, x2, lsl #3]
+    add     x2, x2, #1
+    b       .Ldev_loop
+.Ldev_done:
 
-    // Entry 1: 0x40000000, Normal memory, cacheable, executable (RAM) --
-    // but instead of one flat 1GB block (which would force the *entire*
-    // kernel+RAM range to carry the same EL0 permission bit), point this
-    // entry at a level-2 table of 2MB blocks, so only a small designated
-    // sub-region can be granted EL0 access. Most of RAM (including the
-    // kernel itself) stays EL1-only, matching the original behavior.
-    ldr     x22, =__page_table_l2
-    mov     x0, x22
-    mov     x1, #4096
-    add     x1, x0, x1
-.Lpt2_zero:
-    cmp     x0, x1
-    b.ge    .Lpt2_zero_done
-    str     xzr, [x0], #8
-    b       .Lpt2_zero
-.Lpt2_zero_done:
-
-    mov     x23, #0             // loop index i (0..511)
-    mov     x24, #0x40000000    // base address of entry i
-.Ll2_loop:
-    cmp     x23, #512
-    b.ge    .Ll2_done
-    mov     x0, x24
+    // RAM slots: TG slots 32..63 cover VAs [0x40000000, 0x80000000) in
+    // 32MB Normal identity blocks, EL1-only (kernel + RAM). Slots 64..127
+    // (VAs >= 0x80000000) stay invalid.
+    mov     x2, #32
+.Lram_loop:
+    cmp     x2, #64
+    b.ge    .Lram_done
+    lsl     x0, x2, #TG_INDEX_SHIFT
     orr     x0, x0, #DESC_AF
     orr     x0, x0, #DESC_SH_INNER
     orr     x0, x0, #DESC_BLOCK
-    str     x0, [x22, x23, lsl #3]
-    add     x24, x24, #0x200000
-    add     x23, x23, #1
-    b       .Ll2_loop
-.Ll2_done:
-
-    orr     x0, x22, #DESC_TABLE
-    str     x0, [x21, #8]
-
-    // Entries 2-3: Device-nGnRnE, non-executable (unused, safe default).
-    mov     x2, #0x80000000
-    mov     x1, #0x40000000
-    mov     x0, x2
-    orr     x0, x0, #(MAIR_DEVICE_IDX << 2)
-    orr     x0, x0, #DESC_AF
-    orr     x0, x0, #DESC_BLOCK
-    orr     x0, x0, #DESC_UXN
-    orr     x0, x0, #DESC_PXN
-    str     x0, [x21, #16]
-    add     x2, x2, x1
-    mov     x0, x2
-    orr     x0, x0, #(MAIR_DEVICE_IDX << 2)
-    orr     x0, x0, #DESC_AF
-    orr     x0, x0, #DESC_BLOCK
-    orr     x0, x0, #DESC_UXN
-    orr     x0, x0, #DESC_PXN
-    str     x0, [x21, #24]
+    str     x0, [x21, x2, lsl #3]
+    add     x2, x2, #1
+    b       .Lram_loop
+.Lram_done:
 
     ldr     x0, =MAIR_VALUE
     msr     mair_el1, x0
@@ -490,3 +480,4 @@ msg_elr: .asciz " elr_el1="
 msg_far: .asciz " far_el1="
 msg_nl:  .asciz "\n"
 msg_el0_fault: .asciz "\n[EL0] unexpected exception (non-svc)\n"
+msg_no_tgran16: .asciz "\n[mmu] this CPU has no 16KB granule (need -cpu cortex-a76 or max)\n"

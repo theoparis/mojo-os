@@ -13,9 +13,11 @@ COMPILER_RT  := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
 QEMU         ?= qemu-system-aarch64
 OBJCOPY      ?= llvm-objcopy
 
-# Which CPU QEMU should model. cortex-a57 (default) has no 16KB granule;
-# a 16KB page build needs cortex-a76 or max (see docs/16k-pages.md).
-QEMU_CPU     ?= cortex-a57
+# Which CPU QEMU should model. The kernel is built for the 16KB
+# translation granule, so it needs a CPU that implements it (TGran16).
+# cortex-a57 has no 16KB granule; use cortex-a76 (or max) -- boot.S prints
+# a clear error if the emulated CPU lacks it.
+QEMU_CPU     ?= cortex-a76
 
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
