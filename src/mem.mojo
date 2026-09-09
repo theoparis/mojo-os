@@ -31,6 +31,13 @@ def read_u8(addr: Int) -> UInt8:
     return p[]
 
 
+def write_u8(addr: Int, value: UInt8):
+    var p = Pointer[mut=True, T=UInt8, origin=MutUntrackedOrigin](
+        unsafe_from_address=addr
+    )
+    p[] = value
+
+
 def read_u32(addr: Int) -> UInt32:
     var p = Pointer[mut=False, T=UInt32, origin=UntrackedOrigin[mut=False]](
         unsafe_from_address=addr

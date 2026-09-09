@@ -13,10 +13,10 @@ from std.origin import MutUntrackedOrigin, UntrackedOrigin
 from std.sys.defines import MOJO_VERSION
 from std.sys.info import CompilationTarget
 
-from console import print_str, print_uint, println, putc
+from console import print_int, print_str, print_uint, println, putc
 from dtb import BootParams, parse_dtb
-from initrd import print_cpio_summary
 from mem import read_u8
+from ramfs import unpack_cpio
 
 
 @export("memcpy")
@@ -83,10 +83,30 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         else:
             print_str("[cmdline] (none)\n")
 
-    # If QEMU loaded a cpio initrd for us, unpack/list it. This is the first
-    # step toward a real userspace: eventually /init is exec'd from here.
+    # If QEMU loaded a cpio initrd for us, unpack it into a ramfs and
+    # demonstrate that we can list and look up files in it (the first step
+    # toward exec'ing /init).
     if bp.has_initrd:
-        print_cpio_summary(Int(bp.initrd_start), Int(bp.initrd_end))
+        var fs = unpack_cpio(Int(bp.initrd_start), Int(bp.initrd_end))
+        print_str("[ramfs] unpacked ")
+        print_uint(UInt64(fs.total()), 10)
+        print_str(" file(s)\n")
+        fs.list()
+        var idx = fs.lookup("/init")
+        if idx >= 0:
+            print_str('[ramfs] lookup "/init" -> entry ')
+            print_int(idx)
+            print_str(" (size=")
+            print_uint(UInt64(fs.entry_size(idx)), 10)
+            print_str(", mode=")
+            print_uint(UInt64(fs.entry_mode(idx)), 8)
+            print_str(")\n[ramfs] /init contents:\n")
+            var d = fs.data_addr(idx)
+            for k in range(fs.entry_size(idx)):
+                putc(read_u8(d + k))
+            putc(0x0A)
+        else:
+            print_str("[ramfs] /init not found\n")
 
     while True:
         _ = 0
