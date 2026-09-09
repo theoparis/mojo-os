@@ -10,39 +10,32 @@
 # Lookup treats paths the way Linux does for an initramfs: "/init" and
 # "./init" and "init" all resolve to the same root file.
 from console import print_cstr, print_str, print_uint, putc
+from cpio import (
+    CPIO_HEADER_LEN,
+    CPIO_MAGIC,
+    CPIO_TRAILER_NAME,
+    cpio_align4,
+    hex_val,
+)
 from mem import align4, cstr_eq, read_u8, write_u8
 
 comptime RAMFS_MAX = 128
 
 
-@always_inline
-def hex_val(c: UInt8) -> UInt32:
-    if (c >= 0x30) and (c <= 0x39):
-        return UInt32(c - 0x30)
-    elif (c >= 0x61) and (c <= 0x66):
-        return UInt32(c - 0x61 + 10)
-    else:
-        return UInt32(c - 0x41 + 10)  # uppercase
-
-
 def read_hex32(addr: Int) -> UInt32:
-    """Parse an 8-digit ASCII-hex u32 (cpio newc fields are hex, big-endian)."""
+    """Parse an 8-digit ASCII-hex u32 (cpio newc fields are hex, not binary)."""
     var v: UInt32 = 0
     for i in range(8):
         v = (v << 4) | hex_val(read_u8(addr + i))
     return v
 
 
-@always_inline
 def is_newc_magic(addr: Int) -> Bool:
-    return (
-        (read_u8(addr) == 0x30)
-        and (read_u8(addr + 1) == 0x37)
-        and (read_u8(addr + 2) == 0x30)
-        and (read_u8(addr + 3) == 0x37)
-        and (read_u8(addr + 4) == 0x30)
-        and (read_u8(addr + 5) == 0x31)
-    )
+    var p = CPIO_MAGIC.ptr()
+    for i in range(6):
+        if read_u8(addr + i) != p[unsafe_offset=i]:
+            return False
+    return True
 
 
 def name_matches(addr: Int, lit: StringLiteral) -> Bool:
@@ -136,20 +129,26 @@ def unpack_cpio(start: Int, end: Int) -> RamFs:
     """Parse a cpio 'newc' archive at [start, end) into a RamFs."""
     var fs = RamFs()
     var off = start
-    while (off + 110) <= end:
+    while (off + CPIO_HEADER_LEN) <= end:
         if not is_newc_magic(off):
             print_str("[ramfs] bad magic\n")
             break
         var mode = read_hex32(off + 14)
         var fsize = Int(read_hex32(off + 54))
         var nsize = Int(read_hex32(off + 94))
-        var name = off + 110
+        var name = off + CPIO_HEADER_LEN
 
         # Trailer entry terminates the archive.
-        if nsize == 11 and cstr_eq(name, "TRAILER!!!"):
+        if nsize == 11 and cstr_eq(name, CPIO_TRAILER_NAME):
             break
 
-        var data = name + align4(nsize)
+        # The cpio spec pads so that (header + pathname) is a multiple of
+        # four bytes *from the start of this entry* -- since the 110-byte
+        # header isn't itself 4-aligned, that's NOT the same as separately
+        # rounding namesize up to a multiple of four (off is always 4-
+        # aligned here, so this cumulative form is what real cpio tools
+        # produce).
+        var data = off + cpio_align4(CPIO_HEADER_LEN + nsize)
         if fs.count < RAMFS_MAX:
             fs.names[fs.count] = name
             fs.datas[fs.count] = data

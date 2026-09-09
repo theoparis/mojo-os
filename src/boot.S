@@ -108,9 +108,20 @@ _start:
 
 // The level-2 table's 2MB entries [USER_L2_FIRST, USER_L2_LAST] (inclusive)
 // are granted EL0 access -- this is where the first userspace process's
-// code and stack will live (0x40000000 + USER_L2_FIRST*2MB, 4MB span).
+// code and stack live. Must stay consistent with USER_REGION_BASE/SIZE
+// below (entries 8,9 => [0x40000000+8*2MB, 0x40000000+10*2MB) = 4MB).
 .equ USER_L2_FIRST,    8
 .equ USER_L2_LAST,     9
+
+// The EL0-accessible region itself: code/data are loaded starting at the
+// bottom (by elf.mojo's load_elf), and the initial stack starts at the
+// very top, growing down. Both MUST fall inside the AP-granted 2MB blocks
+// above -- unlike the kernel's own stack, this can't just be "whatever RAM
+// is free", since only this region has EL0 permission bits set.
+.equ USER_REGION_BASE, 0x41000000
+.equ USER_REGION_SIZE, 0x400000    // 4MB (USER_L2_LAST - USER_L2_FIRST + 1) * 2MB
+.equ USER_CODE_BASE,   USER_REGION_BASE
+.equ USER_STACK_TOP,   (USER_REGION_BASE + USER_REGION_SIZE)
 
 setup_mmu:
     stp     x30, x21, [sp, #-16]!
@@ -325,7 +336,6 @@ exc_handler:
 // ---------------------------------------------------------------------
 .equ EL0_FRAME,   320
 .equ EL0_SVC,     0x15
-.equ EL0_MSGLEN,  26
 
 el0_sync:
     sub     sp, sp, #EL0_FRAME
@@ -417,44 +427,13 @@ launch_el0:
 // EL0 self-test stub (proves the EL0 + syscall machinery before we build
 // an ELF loader): writes a message via the write syscall, then exits.
 // ---------------------------------------------------------------------
-.equ USER_CODE_BASE, 0x41000000   // start of the EL0-accessible 4MB region
-
-.global __el0_selftest
-__el0_selftest:
-    // write(1, el0_msg, EL0_MSGLEN). el0_msg itself stays in kernel .rodata
-    // (only ksyscall/EL1 ever dereferences it, so it doesn't need to move),
-    // but this *code* does, since it needs EL0 execute permission.
-    ldr     x1, =el0_msg
-    mov     x0, #1
-    mov     x2, #EL0_MSGLEN
-    mov     x8, #64            // __NR_write (arm64)
-    svc     #0
-    // exit(0)
-    mov     x0, #0
-    mov     x8, #93            // __NR_exit (arm64)
-    svc     #0
-.Lself_dead:
-    b       .Lself_dead
-.ltorg
-__el0_selftest_end:
-
-.global __run_el0_selftest
-__run_el0_selftest:
-    // Copy the self-test code (and its literal pool) into the EL0-
-    // accessible user region -- it's linked as part of the kernel image,
-    // which is EL1-only, so it can't be executed in place from EL0.
-    ldr     x0, =__el0_selftest
-    ldr     x1, =__el0_selftest_end
-    ldr     x2, =USER_CODE_BASE
-.Lselftest_copy:
-    cmp     x0, x1
-    b.ge    .Lselftest_copy_done
-    ldrb    w3, [x0], #1
-    strb    w3, [x2], #1
-    b       .Lselftest_copy
-.Lselftest_copy_done:
-    ldr     x0, =USER_CODE_BASE
-    ldr     x1, =__el0_stack_top
+// run_user: x0 = entry point of an already-loaded userspace image (its
+// PT_LOAD segments must already sit at their final addresses, inside the
+// EL0-accessible region -- see elf.mojo's load_elf). Launches it with a
+// fresh EL0 stack.
+.global run_user
+run_user:
+    mov     x1, #USER_STACK_TOP
     b       launch_el0
 
 // uart_putc: character (zero-extended) in w0. Clobbers x1-x2.
@@ -513,4 +492,3 @@ msg_elr: .asciz " elr_el1="
 msg_far: .asciz " far_el1="
 msg_nl:  .asciz "\n"
 msg_el0_fault: .asciz "\n[EL0] unexpected exception (non-svc)\n"
-el0_msg: .asciz "Hello from EL0 userspace!\n"

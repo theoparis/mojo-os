@@ -16,6 +16,7 @@ from std.sys.info import CompilationTarget
 
 from console import print_int, print_str, print_uint, println, putc
 from dtb import BootParams, parse_dtb
+from elf import load_elf
 from mem import read_u8
 from ramfs import unpack_cpio
 
@@ -80,9 +81,9 @@ def ksyscall(
     return 0xFFFFFFFFFFFFFFDA
 
 
-def _run_el0_selftest():
-    """Drop to EL0 and run the assembly self-test stub (no ELF yet)."""
-    external_call["__run_el0_selftest", NoneType]()
+def _run_user(entry: Int):
+    """Drop to EL0 at `entry` with a fresh stack (see boot.S:run_user)."""
+    external_call["run_user", NoneType](entry)
 
 
 @export("kmain")
@@ -139,18 +140,18 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             print_uint(UInt64(fs.entry_size(idx)), 10)
             print_str(", mode=")
             print_uint(UInt64(fs.entry_mode(idx)), 8)
-            print_str(")\n[ramfs] /init contents:\n")
-            var d = fs.data_addr(idx)
-            for k in range(fs.entry_size(idx)):
-                putc(read_u8(d + k))
-            putc(0x0A)
+            print_str(")\n")
+
+            var entry = load_elf(fs.data_addr(idx))
+            if entry != 0:
+                print_str("[elf] entry=0x")
+                print_uint(UInt64(entry), 16)
+                print_str("\n[user] dropping to EL0...\n")
+                _run_user(entry)
+            else:
+                print_str("[elf] failed to load /init\n")
         else:
             print_str("[ramfs] /init not found\n")
-
-    # Prove the EL0 machinery: drop to user mode, have the self-test stub
-    # issue a write syscall that prints to the UART, then exit.
-    print_str("\n[user] dropping to EL0...\n")
-    _run_el0_selftest()
 
     while True:
         _ = 0

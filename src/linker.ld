@@ -2,7 +2,12 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x40000000;
+    /* QEMU's `virt` machine loads an ELF kernel at its p_paddr, but a raw
+     * (Linux-protocol) kernel image at RAM base + 0x80000 (0x40000000 +
+     * 0x80000). Linking here makes both boot paths agree, so our absolute
+     * addresses (vector table via VBAR_EL1, page tables, stacks) line up
+     * with where the image is actually resident under either boot method. */
+    . = 0x40080000;
 
     .text : {
         KEEP(*(.text.boot))
@@ -44,18 +49,17 @@ SECTIONS
 
     /* Reserve a stack region for EL1 (grows downward from __stack_top).
      * QEMU's -M virt places RAM at 0x40000000 (default 128 MiB), so this
-     * sits just past the kernel's static image and is cleared with BSS. */
+     * sits just past the kernel's static image and is cleared with BSS.
+     *
+     * Note: the EL0 (userspace) stack is NOT reserved here -- it lives
+     * inside the dedicated EL0-accessible region (USER_REGION_BASE in
+     * boot.S, currently 0x41000000-0x413fffff), which is a fixed
+     * hardware-permission carve-out in the page tables, not something
+     * that should float with the kernel image's size. See boot.S. */
     . = ALIGN(16);
     __stack_bottom = .;
     . += 0x10000;
     __stack_top = .;
-
-    /* Reserve a separate stack for the first EL0 process (grows downward
-     * from __el0_stack_top). EL0 uses SP_EL0, distinct from the EL1 stack. */
-    . = ALIGN(16);
-    __el0_stack_bottom = .;
-    . += 0x10000;
-    __el0_stack_top = .;
 
     /DISCARD/ : {
         *(.comment)

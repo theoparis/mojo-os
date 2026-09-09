@@ -38,8 +38,23 @@ def write_u8(addr: Int, value: UInt8):
     p[] = value
 
 
+def read_u16(addr: Int) -> UInt16:
+    var p = Pointer[mut=False, T=UInt16, origin=UntrackedOrigin[mut=False]](
+        unsafe_from_address=addr
+    )
+    return p[]
+
+
 def read_u32(addr: Int) -> UInt32:
     var p = Pointer[mut=False, T=UInt32, origin=UntrackedOrigin[mut=False]](
+        unsafe_from_address=addr
+    )
+    return p[]
+
+
+def read_u64(addr: Int) -> UInt64:
+    """Native (little-endian) 64-bit read -- for ELF fields, not the DTB."""
+    var p = Pointer[mut=False, T=UInt64, origin=UntrackedOrigin[mut=False]](
         unsafe_from_address=addr
     )
     return p[]
