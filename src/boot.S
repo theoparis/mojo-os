@@ -7,6 +7,15 @@
 .equ UART_TXFF, 0x20
 
 _start:
+    // QEMU's `virt` machine passes boot parameters to the kernel entry in
+    // x0-x3 (Linux boot protocol style): x0 = physical address of the DTB
+    // (or 0 if none), x1-x3 = 0. Preserve them in callee-saved registers
+    // before anything clobbers them, then hand them to kmain later.
+    mov     x28, x0     // dtb pointer
+    mov     x27, x1
+    mov     x26, x2
+    mov     x25, x3
+
     // Core check: only let core 0 proceed; park others
     mrs     x0, mpidr_el1
     and     x0, x0, #0xFF
@@ -48,7 +57,12 @@ _start:
     bl      setup_mmu
 
 .Ljump_kernel:
-    // Jump straight to the Mojo entry symbol
+    // Jump to the Mojo entry symbol, handing over the boot parameters
+    // preserved at _start (x0 = DTB physical address).
+    mov     x0, x28
+    mov     x1, x27
+    mov     x2, x26
+    mov     x3, x25
     bl      kmain
 
 // Fail-safe catch loop

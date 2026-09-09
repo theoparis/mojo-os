@@ -1,116 +1,22 @@
+# Mojo OS kernel entry point.
+#
+# This module owns kmain (boot orchestration) plus the two runtime glue
+# exports the compiler/stdlib expect a freestanding program to provide:
+#   * memcpy                    - the LLVM backend can lower some copies to a
+#                                 libcall rather than inline them
+#   * __mojo_baremetal_debug_write - debug_assert failure sink (see the
+#                                 BareMetalPlugin in the patched stdlib)
+# These exports must live in the top-level module passed to `mojo build`,
+# because an @export in an imported-but-unreferenced module is not emitted.
 from std.memory.pointer import Pointer
 from std.origin import MutUntrackedOrigin, UntrackedOrigin
-from std.format import Writer
-from std.collections.string.string_span import StringSpan
-from std.collections.array import Array
 from std.sys.defines import MOJO_VERSION
 from std.sys.info import CompilationTarget
 
-comptime FR_TXFF: UInt32 = 0x20
-comptime FR_RXFE: UInt32 = 0x10
-
-comptime HEX_DIGITS = "0123456789abcdef"
-
-
-@always_inline
-def mmio_read_u32[addr: IntLiteral]() -> UInt32:
-    var p = Pointer[mut=True, T=UInt32, origin=MutUntrackedOrigin](
-        unsafe_from_address=addr
-    )
-    return p.unsafe_load[volatile=True]()
-
-
-@always_inline
-def mmio_write_u32[addr: IntLiteral](value: UInt32):
-    var p = Pointer[mut=True, T=UInt32, origin=MutUntrackedOrigin](
-        unsafe_from_address=addr
-    )
-    p.unsafe_store[volatile=True](value)
-
-
-@always_inline
-def putc(c: UInt8):
-    """Transmit a byte, blocking until the TX FIFO has room."""
-    while (mmio_read_u32[0x09000018]() & FR_TXFF) != 0:
-        _ = 0
-    mmio_write_u32[0x09000000](UInt32(c))
-
-
-@always_inline
-def getc() -> UInt8:
-    """Receive a byte, blocking until the RX FIFO is non-empty."""
-    while (mmio_read_u32[0x09000018]() & FR_RXFE) != 0:
-        _ = 0
-    return UInt8(mmio_read_u32[0x09000000]() & 0xFF)
-
-
-def print_str(s: StringLiteral):
-    var ptr = s.ptr()
-    while ptr[] != 0:
-        putc(ptr[])
-        ptr = ptr.unsafe_offset(1)
-
-
-def print_uint(value: UInt64, base: UInt64):
-    """Emit an unsigned integer in `base` (2..16), most-significant digit first.
-
-    Uses a fixed stack buffer — no heap allocation, no libc.
-    """
-    var buf = Array[UInt8, 64](uninitialized=True)
-    var n: Int = 0
-    var rem: UInt64 = value
-
-    if rem == 0:
-        buf[0] = 0x30  # '0'
-        n = 1
-    else:
-        while rem > 0:
-            var d = Int(rem % base)
-            buf[n] = HEX_DIGITS.ptr().unsafe_offset(d)[]
-            rem = rem // base
-            n += 1
-
-    while n > 0:
-        n -= 1
-        putc(buf[n])
-
-
-@always_inline
-def print_int(value: Int):
-    if value < 0:
-        putc(0x2D)  # '-'
-        print_uint(UInt64(-value), 10)
-    else:
-        print_uint(UInt64(value), 10)
-
-
-@always_inline
-def print_hex(value: UInt64):
-    putc(0x30)  # '0'
-    putc(0x78)  # 'x'
-    print_uint(value, 16)
-
-
-struct UARTWriter(Writer):
-    def __init__(out self):
-        pass
-
-    def write_string(mut self, string: StringSpan):
-        var ptr = string.unsafe_ptr()
-        for _ in range(string.byte_length()):
-            putc(ptr[])
-            ptr = ptr.unsafe_offset(1)
-
-
-def write[V: Writable](v: V):
-    var w = UARTWriter()
-    v.write_to(w)
-
-
-def println[V: Writable](v: V):
-    var w = UARTWriter()
-    v.write_to(w)
-    putc(0x0A)
+from console import print_str, print_uint, println, putc
+from dtb import BootParams, parse_dtb
+from initrd import print_cpio_summary
+from mem import read_u8
 
 
 @export("memcpy")
@@ -141,13 +47,46 @@ def _mojo_baremetal_debug_write(message_addr: Int, length: Int) abi("C"):
 
 
 @export("kmain")
-def kmain() abi("C"):
+def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
     var arch = StringLiteral[CompilationTarget[].__triple_arch()]()
     println(
         t"Hello from bare-metal {arch}, built with Mojo"
         t" {MOJO_VERSION.major}.{MOJO_VERSION.minor}.{MOJO_VERSION.patch},"
         t" running on QEMU!\n"
     )
+
+    # x0 is the physical address of the DTB handed to us by QEMU (Linux
+    # boot protocol). Everything else hangs off it.
+    var bp = parse_dtb(x0)
+    if not bp.has_dtb:
+        print_str("[dtb] none passed in x0\n")
+    else:
+        print_str("[dtb] @0x")
+        print_uint(UInt64(x0), 16)
+        if bp.has_initrd:
+            print_str("  initrd [0x")
+            print_uint(bp.initrd_start, 16)
+            print_str(", 0x")
+            print_uint(bp.initrd_end, 16)
+            print_str(")")
+        else:
+            print_str("  no initrd in /chosen")
+        putc(0x0A)
+        if bp.cmdline_len > 0:
+            print_str('[cmdline] "')
+            var n = bp.cmdline_len
+            if read_u8(bp.cmdline_addr + n - 1) == 0:
+                n -= 1
+            for i in range(n):
+                putc(read_u8(bp.cmdline_addr + i))
+            print_str('"\n')
+        else:
+            print_str("[cmdline] (none)\n")
+
+    # If QEMU loaded a cpio initrd for us, unpack/list it. This is the first
+    # step toward a real userspace: eventually /init is exec'd from here.
+    if bp.has_initrd:
+        print_cpio_summary(Int(bp.initrd_start), Int(bp.initrd_end))
 
     while True:
         _ = 0

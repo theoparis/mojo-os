@@ -10,7 +10,7 @@ QEMU         ?= qemu-system-aarch64
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -c
-MOJOFLAGS    := -mojo-search-paths $(MOJO_STDLIB) --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := -mojo-search-paths $(MOJO_STDLIB) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 BUILD_DIR    := build
 KERNEL_ELF   := $(BUILD_DIR)/kernel.elf
