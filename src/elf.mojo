@@ -4,15 +4,17 @@
 # static, non-PIE ET_EXEC binary with a handful of PT_LOAD segments. No
 # relocations, no dynamic linking, no PIE base slide.
 #
-# Each PT_LOAD is mapped into the user page tables *first* (via
-# src/paging.mojo, at 4KB granularity with per-page permissions derived
-# from p_flags), then its bytes are copied to p_vaddr and the
-# p_memsz-p_filesz tail is zeroed (bss). p_vaddr is taken literally (the
-# EL0-accessible window is identity-mapped), so the image must already
-# target an address in that window -- src/user/user.ld arranges this.
+# Each PT_LOAD is mapped into the user VA space *first* (via
+# src/paging.mojo:map_user at 4KB granularity, permissions from p_flags;
+# map_user allocates real physical frames, so p_vaddr is a genuine virtual
+# address, not a physical one), then its bytes are copied to p_vaddr and
+# the p_memsz-p_filesz tail is zeroed (bss). p_vaddr is taken literally, so
+# a static non-PIE image links at its natural low VA (e.g. busybox/musl at
+# 0x400000); the kernel copy reads from the file bytes in RAM (identity
+# PA) and writes to the just-mapped low VA (EL1 can access EL0 pages).
 from console import print_str, print_uint
 from mem import read_u16, read_u32, read_u64, read_u8, write_u8
-from paging import map_user_region
+from paging import map_user
 from phys import PhysAlloc
 
 comptime ET_EXEC: UInt16 = 2
@@ -86,12 +88,13 @@ def elf_image_end(base: Int) -> Int:
     return end
 
 
-def load_elf(mut alloc: PhysAlloc, l2: Int, base: Int) -> Int:
-    """Map and load the ELF64/AArch64 image at `base` into the user window.
+def load_elf(mut alloc: PhysAlloc, l1: Int, base: Int) -> Int:
+    """Map and load the ELF64/AArch64 image at `base` into the user VA space.
 
-    `base` points at the file bytes in memory (e.g. a ramfs entry); each
-    PT_LOAD segment is mapped with permissions from its p_flags, copied to
-    p_vaddr, and its bss tail zeroed. Returns the entry address (0 = fail).
+    `base` points at the file bytes in memory (e.g. a ramfs entry); `l1` is
+    the kernel level-1 page-table address. Each PT_LOAD segment is mapped
+    with permissions from its p_flags, copied to p_vaddr, and its bss tail
+    zeroed. Returns the entry address (0 = fail).
     """
     if not elf_is_valid(base):
         print_str("[elf] not a recognized ELF64/aarch64 image\n")
@@ -134,8 +137,8 @@ def load_elf(mut alloc: PhysAlloc, l2: Int, base: Int) -> Int:
             print_str(" flags=")
             print_uint(UInt64(p_flags), 16)
             print_str("\n")
-            if not map_user_region(alloc, l2, p_vaddr, p_memsz, exec):
-                print_str("[elf] map_user_region failed\n")
+            if not map_user(alloc, l1, p_vaddr, p_memsz, exec):
+                print_str("[elf] map_user failed\n")
                 return 0
 
             var k = 0

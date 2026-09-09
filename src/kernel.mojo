@@ -19,7 +19,7 @@ from dtb import BootParams, MemRegions, parse_dtb
 from elf import elf_image_end, elf_phdrs, load_elf
 from kstate import (
     OFF_FREE_HEAD,
-    OFF_L2,
+    OFF_L1,
     OFF_RAM_BASE,
     OFF_RAM_END,
     OFF_USER_BASE,
@@ -30,11 +30,10 @@ from kstate import (
     set64,
     set_brk,
     set_mmap_next,
-    user_hi,
     user_map,
 )
 from mem import read_u16, read_u8, write_u8
-from paging import map_user_region
+from paging import USER_VA_TOP, init_user_vm, map_user
 from phys import PhysAlloc
 from ramfs import unpack_cpio
 
@@ -59,8 +58,13 @@ comptime SYS_GETRANDOM: UInt64 = 278
 comptime SYS_CLOCK_GETTIME: UInt64 = 113
 comptime SYS_SET_TID_ADDRESS: UInt64 = 96
 
-comptime USER_WINDOW_BASE: Int = 0x41000000
+# Userspace lives in the low 128MB VA space carved out of L1[0] by
+# paging.mojo (user VA != PA). The EL0 stack sits at its very top
+# (0x08000000 down) and anonymous mmaps descend from just below it. brk
+# grows up from the end of the image and is capped at USER_HEAP_TOP, below
+# which mmap never descends.
 comptime USER_STACK_SIZE: Int = 0x10000  # 64KB initial user stack
+comptime USER_HEAP_TOP: Int = 0x04000000  # brk cap == mmap floor (64MB)
 
 # Linux errno returns, pre-encoded as UInt64 (they come back negative).
 comptime E_NOSYS: UInt64 = 0xFFFFFFFFFFFFFFDA  # -38
@@ -80,6 +84,17 @@ def _memcpy(dest: Int, src: Int, n: Int) abi("C") -> Int:
     )
     for i in range(n):
         d[unsafe_offset=i] = s[unsafe_offset=i]
+    return dest
+
+
+@export("memset")
+def _memset(dest: Int, val: Int, n: Int) abi("C") -> Int:
+    var d = Pointer[mut=True, T=UInt8, origin=MutUntrackedOrigin](
+        unsafe_from_address=dest
+    )
+    var v = UInt8(val)
+    for i in range(n):
+        d[unsafe_offset=i] = v
     return dest
 
 
@@ -124,12 +139,9 @@ def _setup_allocator(
     if mem.n() < 1:
         return False
     alloc.reserve(klo, khi)
-    # Reserve the *entire* userspace window -- everything from
-    # USER_WINDOW_BASE up to the top of RAM -- so the allocator never hands
-    # out frames for kernel structures inside it; pages there are granted
-    # EL0 access at 4KB granularity by paging.mojo on demand.
-    if mem.end(0) > UInt64(USER_WINDOW_BASE):
-        alloc.reserve(UInt64(USER_WINDOW_BASE), mem.end(0))
+    # Only the kernel image, initrd and DTB are carved out up front. User
+    # pages no longer live in a reserved identity window -- map_user hands
+    # out ordinary physical frames from this same allocator on demand.
     if bp.has_initrd:
         alloc.reserve(bp.initrd_start, bp.initrd_end)
     if bp.dtb_end > bp.dtb_start:
@@ -140,16 +152,16 @@ def _setup_allocator(
 
 def _sys_brk(addr: Int) -> UInt64:
     """brk(addr): set/query the program break. Pages between the old and new
-    break are mapped EL0 read/write on demand (no reclaim on shrink)."""
+    break are mapped EL0 read/write on demand (no reclaim on shrink), capped
+    below the top of the user heap region."""
     var cur = brk_cur()
     if addr == 0:
         return UInt64(cur)
     if addr <= cur:
         set_brk(addr)
         return UInt64(addr)
-    # Grow: cap just under the EL0 stack we reserved at the top of RAM.
-    var cap = user_hi() - USER_STACK_SIZE
-    if addr > cap:
+    # Grow: cap at the top of the low heap region, well below the stack.
+    if addr > USER_HEAP_TOP:
         return E_MEM
     if not user_map(cur, addr - cur, False):
         return E_MEM
@@ -160,10 +172,12 @@ def _sys_brk(addr: Int) -> UInt64:
 def _sys_mmap(addr: Int, length: Int, prot: Int, flags: Int, fd: Int) -> UInt64:
     """mmap(addr, length, prot, flags, fd, offset): anonymous mappings only.
 
-    Pages are identity-mapped EL0 (read/write, executable if PROT_EXEC).
-    Anonymous regions are carved from the TOP of the user window downward
-    (mmap_next = current top), so they never collide with brk (which grows
-    up from the end of the image) or the EL0 stack at the very top."""
+    Maps *virtual* addresses in the low user VA space onto fresh physical
+    frames (read/write, executable if PROT_EXEC). A NULL addr carves a
+    region from the TOP of the user VA space downward (mmap_next, just
+    below the EL0 stack) so it never collides with brk, which grows up from
+    the image end and is capped at USER_HEAP_TOP. MAP_FIXED maps at the
+    requested address instead."""
     if length <= 0:
         return E_INVAL
     var anon = (flags & 0x20) != 0
@@ -172,18 +186,21 @@ def _sys_mmap(addr: Int, length: Int, prot: Int, flags: Int, fd: Int) -> UInt64:
         return E_NOSYS
     var page = 0x1000
     var nbytes = (length + page - 1) & ~(page - 1)
-    var base = addr
-    if base == 0:
-        base = mmap_next() - nbytes
+    var fixed = (flags & 0x10) != 0  # MAP_FIXED
+    var base: Int
+    if fixed:
+        base = (addr + page - 1) & ~(page - 1)
     else:
-        base = (base + page - 1) & ~(page - 1)
-    var lo = USER_WINDOW_BASE
-    if base < lo or base + nbytes > mmap_next():
+        base = mmap_next() - nbytes
+    if base < 0x10000 or base + nbytes > USER_VA_TOP:
         return E_MEM
+    if not fixed and base < USER_HEAP_TOP:
+        return E_MEM  # don't descend into the brk region
     var exec = (prot & 1) != 0
     if not user_map(base, nbytes, exec):
         return E_MEM
-    set_mmap_next(base)
+    if not fixed:
+        set_mmap_next(base)
     return UInt64(base)
 
 
@@ -385,11 +402,11 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
     )
 
     # x0 = DTB physical address (Linux boot protocol); x1/x2 = kernel image
-    # static extent [start, end); x3 = level-2 page-table address, as set up
+    # static extent [start, end); x3 = level-1 page-table address, as set up
     # by boot.S from linker symbols.
     var kernel_lo = UInt64(x1)
     var kernel_hi = UInt64(x2)
-    var l2base = x3
+    var l1base = x3
     var mem = MemRegions()
     var bp = parse_dtb(x0, mem)
     if not bp.has_dtb:
@@ -423,6 +440,9 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
         print_str("[alloc] total free: 0x")
         print_uint(alloc.free_total(), 16)
         putc(0x0A)
+        # Carve the low 128MB out of L1[0] as a real user VA space.
+        if not init_user_vm(alloc, l1base):
+            print_str("[paging] init_user_vm failed\n")
     else:
         print_str("[alloc] no RAM region from /memory\n")
 
@@ -444,30 +464,13 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
             var imgend = elf_image_end(fdata)
             var phdr = elf_phdrs(fdata)
             var phnum = Int(read_u16(fdata + 56))
-            var entry = load_elf(alloc, l2base, fdata)
+            var entry = load_elf(alloc, l1base, fdata)
 
             if entry != 0 and mem.n() >= 1:
-                # Kernel state for the syscall layer: allocator free list +
-                # page table + RAM bounds + user window + brk/mmap cursors.
-                var ram_end = Int(mem.end(0))
-                set64(OFF_FREE_HEAD, alloc.free_head)
-                set64(OFF_RAM_BASE, mem.base(0))
-                set64(OFF_RAM_END, mem.end(0))
-                set64(OFF_L2, UInt64(l2base))
-                set64(OFF_USER_BASE, UInt64(USER_WINDOW_BASE))
-                set64(OFF_USER_HI, mem.end(0))
-                var heap_base = (imgend + 0xFFFF) & ~0xFFFF
-                set_brk(heap_base)
-
-                # EL0 stack at the very top of RAM, growing down.
-                var stack_top = ram_end & ~15
+                # EL0 stack at the top of the user VA space, growing down.
+                var stack_top = USER_VA_TOP
                 var stack_base = stack_top - USER_STACK_SIZE
-                # Anonymous mmaps are carved top-down from just below the
-                # stack so they can never collide with brk's upward growth.
-                set_mmap_next(stack_base)
-                if map_user_region(
-                    alloc, l2base, stack_base, USER_STACK_SIZE, False
-                ):
+                if map_user(alloc, l1base, stack_base, USER_STACK_SIZE, False):
                     print_str("[user] stack [0x")
                     print_uint(UInt64(stack_base), 16)
                     print_str(", 0x")
@@ -475,6 +478,23 @@ def kmain(x0: Int, x1: Int, x2: Int, x3: Int) abi("C"):
                     print_str(")\n")
                 else:
                     print_str("[user] stack mapping failed\n")
+
+                # Snapshot kernel state for the syscall layer once all the
+                # static mappings (image + stack) are in place: allocator
+                # free-list head, RAM bounds, L1 table, user VA space,
+                # brk/mmap cursors.
+                var heap_base = (imgend + 0xFFFF) & ~0xFFFF
+                set64(OFF_FREE_HEAD, alloc.free_head)
+                set64(OFF_RAM_BASE, mem.base(0))
+                set64(OFF_RAM_END, mem.end(0))
+                set64(OFF_L1, UInt64(l1base))
+                set64(OFF_USER_BASE, 0)
+                set64(OFF_USER_HI, UInt64(USER_VA_TOP))
+                set_brk(heap_base)
+                # Anonymous mmaps descend top-down from just below the stack,
+                # so they can never collide with brk's upward growth.
+                set_mmap_next(stack_base)
+
                 print_str("[user] brk base=0x")
                 print_uint(UInt64(heap_base), 16)
                 print_str(" phdr=0x")

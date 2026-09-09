@@ -3,9 +3,10 @@
 // syscalls that any real program needs. Pure inline-asm Linux syscalls,
 // no libc.
 //
-// Compiled freestanding and linked at 0x41000000 by src/user/user.ld; the
-// kernel erets to _start with the initial SP arranged like Linux: [sp] =
-// argc, [sp+8..] = argv[], NULL, envp[], NULL, auxv[].
+// Compiled freestanding and linked at 0x400000 by src/user/user.ld (the same
+// low VA a static musl/busybox uses); the kernel maps it into the real user
+// VA space and erets to _start with the initial SP arranged like Linux:
+// [sp] = argc, [sp+8..] = argv[], NULL, envp[], NULL, auxv[].
 typedef unsigned long u64;
 typedef unsigned char u8;
 typedef long s64;

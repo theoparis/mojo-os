@@ -6,7 +6,7 @@
 # shared across the two exported functions. Fields (u64 each):
 #   0   free list head of the physical allocator
 #   8   RAM base / 16 RAM end (DTB /memory)
-#   24  level-2 page-table address
+#   24  level-1 page-table address (TTBR0 / __page_table)
 #   32  brk cursor (user program break)
 #   40  next anonymous mmap address
 #   48  user window base / 56 high end
@@ -14,13 +14,13 @@
 from std.ffi import external_call
 
 from mem import read_u64, write_u64
-from paging import map_user_region
+from paging import map_user
 from phys import PhysAlloc
 
 comptime OFF_FREE_HEAD: Int = 0
 comptime OFF_RAM_BASE: Int = 8
 comptime OFF_RAM_END: Int = 16
-comptime OFF_L2: Int = 24
+comptime OFF_L1: Int = 24
 comptime OFF_BRK: Int = 32
 comptime OFF_MMAP: Int = 40
 comptime OFF_USER_BASE: Int = 48
@@ -57,8 +57,8 @@ def ram_end() -> UInt64:
     return get64(OFF_RAM_END)
 
 
-def l2() -> Int:
-    return Int(get64(OFF_L2))
+def l1() -> Int:
+    return Int(get64(OFF_L1))
 
 
 def brk_cur() -> Int:
@@ -83,10 +83,11 @@ def user_hi() -> Int:
 
 def user_map(va: Int, size: Int, exec: Bool) -> Bool:
     """Map user pages, attaching the allocator to the saved free list so the
-    free-list head stays in kernel state across syscalls."""
+    free-list head stays in kernel state across syscalls. VA is a user
+    virtual address (in the low VA space); frames come from the allocator."""
     var a = PhysAlloc()
     a.attach(free_head(), ram_base(), ram_end())
-    var ok = map_user_region(a, l2(), va, size, exec)
+    var ok = map_user(a, l1(), va, size, exec)
     set_free_head(a.free_head)
     return ok
 

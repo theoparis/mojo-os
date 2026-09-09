@@ -1,20 +1,39 @@
-# Userspace page mapping.
+# Userspace virtual memory (proper paging: user VA != PA).
 #
-# At boot, boot.S maps the whole RAM range EL1-only with 2MB level-2 block
-# descriptors. That gives EL0 nothing to run on. This module grants EL0
-# access at *4KB page granularity*, on demand: for each 2MB slot that a
-# requested range touches, it replaces the slot's block descriptor with a
-# fresh level-3 table (a 4KB frame from the physical allocator) whose 512
-# page descriptors default to identity EL1-only, then flips the specific
-# pages to carry EL0 permissions:
-#     exec pages: AP=11 (EL1 RW / EL0 RO) + executable  -> user code
-#     data pages: AP=01 (EL1 RW / EL0 RW) + UXN          -> user data/stack
-# Because the map is identity (VA == PA), the caller writes the segment
-# bytes at the same addresses the user will read them from.
+# The kernel itself runs on an *identity* map (VA == PA) built in boot.S: a
+# 4KB-granule, T0SZ=32 level-1 table where L1[0] is a flat 1GB Device block
+# (peripherals below 1GB), L1[1] points at a level-2 table of 2MB Normal
+# blocks for RAM (0x40000000-0x80000000, all EL1-only), and L1[2..3] are
+# Device. The kernel keeps using that identity map for itself.
+#
+# Userspace gets a *real virtual address space* in the low 128MB
+# (0x00000000-0x08000000), distinct from physical memory. Standard
+# non-PIE ET_EXEC binaries link at 0x400000 (e.g. static busybox), and
+# Linux-compatible brk/mmap regions live in that same low VA range. User
+# VAs are translated to physical frames handed out by the physical
+# allocator, so nothing userspace touches is forced to sit at its physical
+# address.
+#
+# To give userspace VAs we hang a second level-2 table under L1[0] (call it
+# "L2-A", one fresh 4KB frame):
+#   - slots 0..63  (VAs 0x00000000-0x08000000): the user VA space. Left
+#     unmapped at first; pages are mapped at 4KB granularity via
+#     lazily-created level-3 tables as the loader/syscalls demand them.
+#   - slots 64..511 (VAs 0x08000000-0x40000000): Device-nGnRnE identity
+#     blocks, mirroring the flat map so the kernel's MMIO (UART/GIC...)
+#     still works after L1[0] is repointed.
+# init_user_vm() builds and installs L2-A; map_user() maps user pages.
+#
+# Executable pages are mapped EL0 read/write+execute (AP[2:1]=01, UXN
+# clear) and data/stack pages EL0 read/write non-executable (UXN set).
+# Read-only pages (mprotect-style) would need a two-phase map (see the AP
+# note in the old code) -- deferred until there's a proper mm layer.
 #
 # All of the shifts/counts below are 4KB-granule-specific; the notes on
 # what changes for a 16KB granule are in docs/16k-pages.md.
 from std.ffi import external_call
+from std.memory.pointer import Pointer
+from std.origin import MutUntrackedOrigin
 
 from mem import read_u64, write_u64
 from phys import PhysAlloc
@@ -22,21 +41,20 @@ from phys import PhysAlloc
 comptime PAGE_SIZE: Int = 4096
 comptime PAGE_MASK: Int = 4095
 comptime SLOT_SIZE: Int = 0x200000  # one 2MB level-2 slot (512 x 4KB pages)
-comptime RAM_BASE: Int = 0x40000000  # where the L2 table's coverage starts
-comptime RAM_SPAN: Int = 0x40000000  # the L2 table covers 1GB
+comptime USER_VA_TOP: Int = 0x08000000  # user VAs live in [0, this)
+comptime USER_SLOTS: Int = USER_VA_TOP // SLOT_SIZE  # = 64 L2 slots
 
 # descriptor bits (4KB granule, stage 1)
 comptime D_PAGE: UInt64 = 0x3  # page descriptor at level 3
-comptime D_TABLE: UInt64 = 0x3  # table descriptor at level 2
+comptime D_TABLE: UInt64 = 0x3  # table descriptor
+comptime D_BLOCK: UInt64 = 0x1  # block descriptor
+comptime D_DEV: UInt64 = 0x4  # MAIR attr idx 1 (Device-nGnRnE) at bits[4:2]
 comptime D_AF: UInt64 = 0x400
 comptime D_SH_INNER: UInt64 = 0x300
 comptime D_AP_RW_EL0: UInt64 = 0x40  # AP[2:1]=01: EL1 RW, EL0 RW
-# AP[2:1]=0b11 (0xC0) is nominally EL1 RW/EL0 RO, but QEMU reports an
-# EL1 write-permission fault on it, so read-only+exec pages (mprotect-style)
-# would need a two-phase map: write with EL0 access off, then flip AP. For
-# now executable pages are mapped EL0 RW+exec and data EL0 RW non-exec.
 comptime D_UXN: UInt64 = 0x0040000000000000  # bit 54: EL0 cannot execute
-comptime D_ADDR_MASK: UInt64 = 0x0000FFFFFFFFF000  # table address [47:12]
+comptime D_PXN: UInt64 = 0x0020000000000000  # bit 53: EL1 cannot execute
+comptime D_ADDR_MASK: UInt64 = 0x0000FFFFFFFFF000
 
 
 def flush_tlb_all():
@@ -44,60 +62,106 @@ def flush_tlb_all():
     external_call["flush_tlb_all", NoneType]()
 
 
-def _ensure_l3(mut alloc: PhysAlloc, l2: Int, slot: Int) -> UInt64:
-    """Return the level-3 table address covering 2MB `slot`, creating it if
-    the slot is still a plain block descriptor (or unmapped).
+@always_inline
+def _zero_page(pa: Int):
+    """Zero a 4KB physical frame (fresh frames from the allocator are not
+    guaranteed clean, and userspace must see zeroed anon/brk pages)."""
+    var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
+        unsafe_from_address=pa
+    )
+    for j in range(PAGE_SIZE // 8):
+        p[unsafe_offset=j] = 0
 
-    A new table is a zero-fill of identity, EL1-only 4KB pages so the slot
-    keeps covering the same RAM it covered as a block; EL0 stays out until
-    individual pages are flipped below.
+
+def init_user_vm(mut alloc: PhysAlloc, l1: Int) -> Bool:
+    """Split L1[0] (a flat 1GB Device block) into L2-A so the low 128MB
+    become a real user VA space.
+
+    Builds one fresh level-2 table: slots 0..63 are invalid (user VA space,
+    populated lazily by map_user); slots 64..511 are 2MB Device-nGnRnE
+    identity blocks mirroring the old flat mapping so the kernel's MMIO
+    keeps working. Then repoints L1[0] at it and flushes the TLB.
     """
-    var ent = read_u64(l2 + slot * 8)
-    if (ent & UInt64(0x3)) == D_TABLE:
-        return ent & D_ADDR_MASK
-
     var table = alloc.alloc_pages(1)
     if table == 0:
-        return 0
-    var tbase = Int(table)
-    var slot_base = RAM_BASE + slot * SLOT_SIZE
+        return False
+    var t = Int(table)
+
+    # zero-fill first (unmapped slots 0..63 are the user VA space)
     for i in range(512):
-        var pa = slot_base + i * PAGE_SIZE
-        write_u64(tbase + i * 8, UInt64(pa) | D_PAGE | D_AF | D_SH_INNER)
-    write_u64(l2 + slot * 8, table | D_TABLE)
-    return table
+        write_u64(t + i * 8, 0)
+
+    # slots 64..511: Device identity blocks (VAs 0x08000000..0x40000000)
+    for i in range(USER_SLOTS, 512):
+        var va = i * SLOT_SIZE
+        var d: UInt64 = UInt64(va) | D_DEV | D_AF | D_BLOCK | D_UXN | D_PXN
+        write_u64(t + i * 8, d)
+
+    # repoint L1[0] at L2-A (was a flat Device block descriptor)
+    write_u64(l1, UInt64(table) | D_TABLE)
+    flush_tlb_all()
+    return True
 
 
-def map_user_region(
-    mut alloc: PhysAlloc, l2: Int, va: Int, size: Int, exec: Bool
+def map_user(
+    mut alloc: PhysAlloc, l1: Int, va: Int, size: Int, exec: Bool
 ) -> Bool:
-    """Grant EL0 access to [va, va+size) page by page (identity-mapped).
+    """Map [va, va+size) as fresh EL0 pages in the low user VA space.
 
-    `exec=True` maps executable pages (read-write for now, see the AP note
-    above); `False` maps read-write but non-executable (data/stack).
-    Returns False if a page can't be mapped (no table frame, or the range
-    escapes the L2 table's RAM span).
+    Allocates a physical frame per page, zeroes it, and writes a PTE with
+    EL0 read/write (+execute when `exec`). A page that is already mapped is
+    left alone (contents preserved), so brk can regrow across a
+    partially-used page and adjacent PT_LOADs sharing a page are harmless.
+    Returns False if any page can't be mapped (no frame, or the range
+    escapes the user VA space).
     """
     if size <= 0:
         return True
-    var addr = va & ~PAGE_MASK
+    var start = va & ~PAGE_MASK
     var endp = (va + size + PAGE_MASK) & ~PAGE_MASK
+    if start < 0 or endp > USER_VA_TOP:
+        return False
+
+    var l1e = read_u64(l1)
+    if (l1e & UInt64(0x3)) != D_TABLE:
+        return False  # init_user_vm hasn't split L1[0] yet
+    var l2a = Int(l1e & D_ADDR_MASK)
+
+    var addr = start
     while addr < endp:
-        if addr < RAM_BASE or addr >= RAM_BASE + RAM_SPAN:
+        var slot = addr // SLOT_SIZE
+        if slot >= USER_SLOTS:
             return False
-        var slot = (addr - RAM_BASE) // SLOT_SIZE
-        var tbl = _ensure_l3(alloc, l2, slot)
-        if tbl == 0:
-            return False
-        var pge = (addr // PAGE_SIZE) % 512
-        var pte = UInt64(addr) | D_PAGE | D_AF | D_SH_INNER
-        if exec:
-            # executable segment: EL0 read/write+execute for now (see note)
-            pte = pte | D_AP_RW_EL0
+        var ent = read_u64(l2a + slot * 8)
+        var l3: Int
+        if (ent & UInt64(0x3)) == D_TABLE:
+            l3 = Int(ent & D_ADDR_MASK)
         else:
-            # user read/write, no user execute
-            pte = pte | D_AP_RW_EL0 | D_UXN
-        write_u64(Int(tbl) + pge * 8, pte)
+            var l3f = alloc.alloc_pages(1)
+            if l3f == 0:
+                return False
+            l3 = Int(l3f)
+            for j in range(512):
+                write_u64(l3 + j * 8, 0)  # all PTEs invalid initially
+            write_u64(l2a + slot * 8, UInt64(l3) | D_TABLE)
+
+        var pge = (addr // PAGE_SIZE) % 512
+        var off = l3 + pge * 8
+        if (read_u64(off) & UInt64(0x3)) == D_PAGE:
+            addr += PAGE_SIZE  # already mapped: keep page + its data
+            continue
+
+        var frame = alloc.alloc_pages(1)
+        if frame == 0:
+            return False
+        _zero_page(Int(frame))
+        var np: UInt64 = (
+            UInt64(frame) | D_PAGE | D_AF | D_SH_INNER | D_AP_RW_EL0
+        )
+        if not exec:
+            np = np | D_UXN
+        write_u64(off, np)
         addr += PAGE_SIZE
+
     flush_tlb_all()
     return True

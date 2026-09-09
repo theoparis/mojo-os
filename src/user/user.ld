@@ -1,12 +1,13 @@
 /* Linker script for freestanding userspace binaries loaded by the kernel's
- * ELF loader (src/elf.mojo). Must match the EL0-accessible region set up in
- * boot.S's level-2 page table (USER_L2_FIRST..USER_L2_LAST, currently
- * 0x41000000-0x413fffff -- 4MB). Non-PIE, ET_EXEC, no relocations. */
+ * ELF loader (src/elf.mojo). Loaded into the real user VA space set up by
+ * src/paging.mojo (low 128MB, 0x00000000-0x08000000), at the same standard
+ * low text base a Linux/musl static binary uses (0x400000). Non-PIE,
+ * ET_EXEC, no relocations. */
 ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x41000000;
+    . = 0x400000;
 
     .text : {
         *(.text .text.*)

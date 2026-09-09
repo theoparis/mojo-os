@@ -63,12 +63,13 @@ _start:
 .Ljump_kernel:
     // Jump to the Mojo entry symbol. x0 = DTB physical address (preserved at
     // _start). x1/x2 carry the kernel's own static extent (linker symbols),
-    // and x3 the level-2 page-table address, so kmain can reserve the
-    // kernel image and later grow L3 (4KB page) tables for userspace off it.
+    // and x3 the level-1 page-table address (TTBR0 / __page_table), so kmain
+    // can repoint L1[0] at a user-address-space table and later grow L3
+    // (4KB page) tables for userspace off the level-2 tables it creates.
     mov     x0, x28
     ldr     x1, =__kernel_start
     ldr     x2, =__stack_top
-    ldr     x3, =__page_table_l2
+    ldr     x3, =__page_table
     bl      kmain
 
 // Fail-safe catch loop
@@ -108,11 +109,11 @@ _start:
 .equ DESC_PXN,         (1 << 53)
 
 // No EL0 access is granted at boot: the whole RAM range is mapped EL1-only
-// with 2MB blocks. Userspace pages are instead mapped at 4KB granularity
-// later, on demand, by the kernel (src/paging.mojo) through lazily-created
-// level-3 tables hung off the level-2 table below -- each L3 entry can then
-// carry its own AP/UXN bits (read+exec code vs read-write data vs stack),
-// which is what a real process image needs.
+// with 2MB blocks. Userspace instead gets a *real* virtual address space in
+// the low 128MB (see src/paging.mojo): kmain repoints L1[0] at a level-2
+// table whose low slots are filled lazily with level-3 user pages (each L3
+// entry carries its own AP/UXN), so user code/data live at ordinary link
+// addresses (e.g. 0x400000) mapped onto physical frames -- VA != PA.
 
 setup_mmu:
     stp     x30, x21, [sp, #-16]!

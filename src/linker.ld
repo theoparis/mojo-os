@@ -49,9 +49,11 @@ SECTIONS
     __page_table = .;
     . += 4096;
 
-    /* Level-2 table (512 x 2MB entries) covering the 1GB RAM range, so a
-     * small "user" sub-region can be granted EL0 access without changing
-     * permissions on the 1GB block the kernel itself executes from. */
+    /* Level-2 table (512 x 2MB entries) covering the 1GB RAM range
+     * (0x40000000-0x80000000). This is the kernel's identity RAM map --
+     * L1[1] points here and all entries are Normal, EL1-only 2MB blocks.
+     * Userspace pages do NOT live here: they get their own low-VA table
+     * (L2-A) hung under L1[0] by src/paging.mojo. */
     . = ALIGN(4096);
     __page_table_l2 = .;
     . += 4096;
@@ -60,11 +62,10 @@ SECTIONS
      * QEMU's -M virt places RAM at 0x40000000 (default 128 MiB), so this
      * sits just past the kernel's static image and is cleared with BSS.
      *
-     * Note: the EL0 (userspace) stack is NOT reserved here -- it lives
-     * inside the dedicated EL0-accessible region (USER_REGION_BASE in
-     * boot.S, currently 0x41000000-0x413fffff), which is a fixed
-     * hardware-permission carve-out in the page tables, not something
-     * that should float with the kernel image's size. See boot.S. */
+     * The EL0 (userspace) stack is NOT reserved here: userspace runs in the
+     * low 128MB *virtual* address space carved out by src/paging.mojo, with
+     * its stack at the top of that space (0x08000000 down) and pages mapped
+     * onto frames from the physical allocator. See src/paging.mojo. */
     . = ALIGN(16);
     __stack_bottom = .;
     . += 0x10000;

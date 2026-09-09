@@ -39,10 +39,10 @@ make run
 | `src/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
 | `src/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
 | `src/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
-| `src/paging.mojo` | 4KB-granule user page maps: lazily-created L3 tables, per-page EL0 perms |
+| `src/paging.mojo` | real user VA space (low 128MB, VA≠PA): split L1[0], lazily-created L3 tables, per-page EL0 perms, frames from the allocator |
 | `src/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |
 | `src/kernel.mojo` | `kmain` orchestration + `ksyscall` + runtime `@export`s |
-| `src/user/` | freestanding userspace source + link script |
+| `src/user/` | freestanding userspace source + link script (linked at 0x400000, the standard low VA busybox/musl uses) |
 | `tools/mkcpio.mojo` | native Mojo tool that builds the cpio initrd |
 | `mojo.patch` | compiler/stdlib patches the patched Mojo build requires |
 | `docs/16k-pages.md` | analysis of what a 16KB-page (granule) MMU build needs |
