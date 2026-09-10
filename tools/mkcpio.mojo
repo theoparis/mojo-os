@@ -6,11 +6,11 @@
 # freestanding aarch64), built and run at `make` time to package the
 # userspace binaries into the cpio initrd the kernel boots with. It shares
 # the archive format layout (field order, header length, hex codec) with
-# the kernel-side reader (src/ramfs.mojo) via src/cpio.mojo, so the
+# the kernel-side reader (src/fs/ramfs.mojo) via src/fs/cpio.mojo, so the
 # on-disk format can't drift between writer and reader.
 from std.sys import argv
 
-from cpio import CPIO_MAGIC, CPIO_TRAILER_NAME, hex_digit
+from fs.cpio import CPIO_MAGIC, CPIO_TRAILER_NAME, hex_digit
 
 
 def append_bytes(mut buf: List[UInt8], lit: StringLiteral, n: Int):
@@ -38,7 +38,7 @@ def append_header(
     mut buf: List[UInt8], mode: UInt32, filesize: UInt32, namesize: UInt32
 ):
     # ino, mode, uid, gid, nlink, mtime, filesize, devmajor, devminor,
-    # rdevmajor, rdevminor, namesize, check -- see src/cpio.mojo.
+    # rdevmajor, rdevminor, namesize, check -- see src/fs/cpio.mojo.
     append_bytes(buf, CPIO_MAGIC, 6)
     append_field(buf, 1)
     append_field(buf, mode)

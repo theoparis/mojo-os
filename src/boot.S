@@ -133,7 +133,7 @@ _start:
 
 // No EL0 access is granted at boot: everything is EL1-only. Userspace gets a
 // *real* low-128MB virtual address space (VA != PA), filled lazily with
-// (16KB or 4KB) user pages by src/paging.mojo; device + RAM ranges stay
+// (16KB or 4KB) user pages by src/mm/paging.mojo; device + RAM ranges stay
 // EL1-only identity maps. The exact table geometry differs by granule and
 // lives in the two setup_mmu bodies below (PAGE_SHIFT selects which is
 // built).
@@ -482,7 +482,7 @@ launch_el0:
 // ---------------------------------------------------------------------
 // run_user: x0 = entry point of an already-loaded, already-mapped userspace
 // image; x1 = the EL0 stack top (kernel picks a mapped region for it). See
-// src/elf.mojo and src/paging.mojo -- mappings are created lazily per page.
+// src/proc/elf.mojo and src/mm/paging.mojo -- mappings are created lazily per page.
 // ---------------------------------------------------------------------
 .global run_user
 run_user:

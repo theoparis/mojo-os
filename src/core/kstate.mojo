@@ -11,12 +11,12 @@
 #   40  next anonymous mmap address
 #   48  user window base / 56 high end
 #   64..92  bitmap of syscall numbers already reported as unimplemented
-#   96   base address of the persistent VFS region (src/vfs.mojo)
+#   96   base address of the persistent VFS region (src/fs/vfs.mojo)
 from std.ffi import external_call
 
-from mem import read_u64, write_u64
-from paging import map_user
-from phys import PhysAlloc
+from arch.mem import read_u64, write_u64
+from mm.paging import map_user
+from mm.phys import PhysAlloc
 
 comptime OFF_FREE_HEAD: Int = 0
 comptime OFF_RAM_BASE: Int = 8

@@ -5,10 +5,10 @@
 # functions, the whole filesystem state lives at a fixed raw address (`base`)
 # that kmain allocates from the physical allocator and records in kernel state
 # (kstate.OFF_VFS); every vfs_*() function takes `base` and reads/writes the
-# flat region with mem helpers, mirroring how src/phys.mojo works.
+# flat region with mem helpers, mirroring how src/mm/phys.mojo works.
 #
 # Model: a *flat* read-only rootfs built from the resident initrd cpio
-# archive (see src/ramfs.mojo). Nodes are:
+# archive (see src/fs/ramfs.mojo). Nodes are:
 #   node 0  = the root directory (virtual; contains every other node)
 #   nodes 1..N-1 = the initrd's files, referenced zero-copy into the archive
 # Everything lives at the filesystem root for now (no subdirectories), which
@@ -17,10 +17,17 @@
 # FD 0/1/2 are reserved for stdio (not in the fd table): the console. File
 # descriptors are opened read-only; writes go to stdout (the UART).
 
-from mem import read_u64, read_u8, write_u16, write_u32, write_u64, write_u8
+from arch.mem import (
+    read_u64,
+    read_u8,
+    write_u16,
+    write_u32,
+    write_u64,
+    write_u8,
+)
 
-comptime VFS_MAXFILES = 48   # files beyond the root directory
-comptime VFS_MAXFD = 24      # open file descriptors (0/1/2 are stdio)
+comptime VFS_MAXFILES = 48  # files beyond the root directory
+comptime VFS_MAXFD = 24  # open file descriptors (0/1/2 are stdio)
 comptime NODE_SZ = 32
 comptime FD_SZ = 24
 # region layout:
@@ -31,8 +38,8 @@ comptime VFS_SLOTS = VFS_MAXFILES + 1
 comptime FD_OFF = 8 + VFS_SLOTS * NODE_SZ
 
 # node field offsets (all u64)
-comptime N_NAME = 0   # addr of NUL-terminated name (in initrd)
-comptime N_DATA = 8   # addr of file data (in initrd)
+comptime N_NAME = 0  # addr of NUL-terminated name (in initrd)
+comptime N_DATA = 8  # addr of file data (in initrd)
 comptime N_SIZE = 16
 comptime N_MODE = 24  # full st_mode incl. S_IFMT type bits
 # fd field offsets (all u64)
@@ -56,6 +63,7 @@ comptime E_INVAL: UInt64 = 0xFFFFFFFFFFFFFFEA  # -22
 comptime E_ROFS: UInt64 = 0xFFFFFFFFFFFFFFE2  # -30
 
 comptime O_DIRECTORY: Int = 0x10000
+
 
 @always_inline
 def node_addr(base: Int, idx: Int) -> Int:
@@ -234,7 +242,7 @@ def close(base: Int, fd: Int) -> UInt64:
     return 0
 
 
-def read(base: Int, fd: Int, dst: Int, count: Int) -> UInt64:
+def read_fd(base: Int, fd: Int, dst: Int, count: Int) -> UInt64:
     if fd < 3 or fd >= VFS_MAXFD or not fd_open(base, fd):
         return E_BADF
     var node = fd_node(base, fd)

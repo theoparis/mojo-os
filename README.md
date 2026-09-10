@@ -38,7 +38,7 @@ and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
 
 ## Filesystem & busybox
 
-The kernel mounts the cpio initrd as a small read-only VFS (src/vfs.mojo) and
+The kernel mounts the cpio initrd as a small read-only VFS (src/fs/vfs.mojo) and
 serves it to userspace through real file syscalls: `openat`, `close`, `read`,
 `write`/`writev` (stdout → UART), `lseek`, `fstat`, `newfstatat`, `getcwd`,
 `getdents64`, plus identity syscalls (uid/gid 0). A static musl busybox as
@@ -62,20 +62,31 @@ future work.
 
 ## Source layout
 
+Mojo sources live under `src/` as nested packages (`-I src` is the search
+root, so imports are e.g. `from mm.paging import map_user`). `__init__.mojo`
+is not required by this toolchain; directories are importable as-is.
+
 | path | purpose |
 |------|---------|
+| `src/kernel.mojo` | top-level build module: runtime `@export`s (`memcpy`/`memset`/`debug_write`) + thin `kmain`/`ksyscall` wrappers delegating to `boot`/`sys` |
 | `src/boot.S` | EL1 boot, MMU/page tables, EL0→EL1 syscall trap, `launch_el0` |
 | `src/linker.ld` | kernel layout (linked at 0x40080000, matches QEMU's raw + ELF load) |
-| `src/mem.mojo` | raw memory accessors (MMIO, reads, byteswaps) |
-| `src/console.mojo` | PL011 UART + libc-free formatting |
-| `src/dtb.mojo` | device-tree parser: `/chosen` (initrd + cmdline) and `/memory` (RAM ranges) |
-| `src/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
-| `src/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
-| `src/vfs.mojo` | minimal VFS over the initrd (flat read-only rootfs) + the fd table and file syscall primitives |
-| `src/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
-| `src/paging.mojo` | real user VA space (low 128MB, VA≠PA): PAGE_SHIFT selects the 4KB/16KB granule; lazily-created leaf tables, per-page EL0 perms, frames from the allocator |
-| `src/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |
-| `src/kernel.mojo` | `kmain` orchestration + `ksyscall` + runtime `@export`s |
+| `src/boot/kmain.mojo` | boot orchestration: DTB, allocator, user VM, VFS mount, ELF load, drop to EL0 |
+| `src/arch/mem.mojo` | raw memory accessors (MMIO, reads, byteswaps, string literals) |
+| `src/arch/console.mojo` | PL011 UART + libc-free formatting |
+| `src/arch/dtb.mojo` | device-tree parser: `/chosen` (initrd + cmdline) and `/memory` (RAM ranges) |
+| `src/mm/phys.mojo` | physical memory allocator seeded from the DTB `/memory` RAM ranges |
+| `src/mm/paging.mojo` | real user VA space (low 128MB, VA≠PA): PAGE_SHIFT selects the 4KB/16KB granule; lazily-created leaf tables, per-page EL0 perms, frames from the allocator |
+| `src/core/kstate.mojo` | kernel state shared between boot and the syscall layer (free-list head, RAM bounds, L1, brk/mmap cursors, VFS base, syscall trace) |
+| `src/fs/cpio.mojo` | cpio 'newc' format constants + hex codec (shared w/ writer) |
+| `src/fs/ramfs.mojo` | unpack cpio initrd into a ramfs (lookup / read) |
+| `src/fs/vfs.mojo` | minimal VFS over the initrd (flat read-only rootfs) + the fd table and file syscall primitives |
+| `src/proc/elf.mojo` | minimal ELF64/aarch64 loader (static ET_EXEC) |
+| `src/proc/cmdline.mojo` | parse the DTB cmdline into the initial process argv (skipping boot params) |
+| `src/proc/userproc.mojo` | lay out the initial Linux stack (argc/argv/envp/auxv) and drop to EL0 |
+| `src/sys/syscall_nr.mojo` | aarch64 Linux syscall numbers + errno values |
+| `src/sys/syscalls.mojo` | brk/mmap/getrandom/clock_gettime/uname handlers |
+| `src/sys/dispatch.mojo` | the syscall switch (`ksyscall` body), served by the VFS + `sys/syscalls` |
 | `src/user/` | freestanding userspace source + link script (linked at 0x400000, the standard low VA busybox/musl uses) |
 | `tools/mkcpio.mojo` | native Mojo tool that builds the cpio initrd |
 | `mojo.patch` | compiler/stdlib patches the patched Mojo build requires |

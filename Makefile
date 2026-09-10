@@ -78,7 +78,9 @@ $(BUILD_DIR):
 $(BUILD_DIR)/boot.o: src/boot.S | $(BUILD_DIR)
 	$(CLANG) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/kernel.o: src/kernel.mojo $(wildcard src/*.mojo) | $(BUILD_DIR)
+KERNEL_SRCS  := $(shell find src -name '*.mojo')
+
+$(BUILD_DIR)/kernel.o: src/kernel.mojo $(KERNEL_SRCS) | $(BUILD_DIR)
 	$(MOJO) build $(MOJOFLAGS) $< -o $@
 
 $(KERNEL_ELF): $(LINKER_SCRIPT) $(OBJS)
@@ -93,7 +95,7 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 # Build the cpio writer as a native (host) mojo executable. Needs the host
 # Mojo CompilerRT (set via env) -- the bare-metal kernel build does not.
-$(MKCPIO): tools/mkcpio.mojo src/cpio.mojo | $(BUILD_DIR)
+$(MKCPIO): tools/mkcpio.mojo src/fs/cpio.mojo | $(BUILD_DIR)
 	$(MOJO_RT_ENV) $(MOJO) build $(MOJO_SEARCH) -I src \
 		tools/mkcpio.mojo -o $@
 

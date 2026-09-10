@@ -109,3 +109,16 @@ def cstr_eq(addr: Int, lit: StringLiteral) -> Bool:
         if read_u8(addr + i) != lc:
             return False
         i += 1
+
+
+def copy_lit(addr: Int, lit: StringLiteral):
+    """Copy a string literal, including its trailing NUL, to memory at
+    `addr`."""
+    var p = lit.ptr()
+    var i: Int = 0
+    while True:
+        var c = p[unsafe_offset=i]
+        write_u8(addr + i, c)
+        if c == 0:
+            return
+        i += 1

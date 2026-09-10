@@ -10,7 +10,7 @@
 #   * `/memory` -> the physical RAM ranges (address+size), using the root
 #     node's #address-cells / #size-cells, so we can build a real physical
 #     memory allocator instead of hard-coding RAM size.
-from mem import align4, cstr_eq, read_u32be, read_u8
+from arch.mem import align4, cstr_eq, read_u32be, read_u8
 
 
 comptime FDT_BEGIN_NODE: UInt32 = 1

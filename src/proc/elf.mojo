@@ -5,17 +5,17 @@
 # relocations, no dynamic linking, no PIE base slide.
 #
 # Each PT_LOAD is mapped into the user VA space *first* (via
-# src/paging.mojo:map_user at 4KB granularity, permissions from p_flags;
+# src/mm/paging.mojo:map_user at 4KB granularity, permissions from p_flags;
 # map_user allocates real physical frames, so p_vaddr is a genuine virtual
 # address, not a physical one), then its bytes are copied to p_vaddr and
 # the p_memsz-p_filesz tail is zeroed (bss). p_vaddr is taken literally, so
 # a static non-PIE image links at its natural low VA (e.g. busybox/musl at
 # 0x400000); the kernel copy reads from the file bytes in RAM (identity
 # PA) and writes to the just-mapped low VA (EL1 can access EL0 pages).
-from console import print_str, print_uint
-from mem import read_u16, read_u32, read_u64, read_u8, write_u8
-from paging import map_user
-from phys import PhysAlloc
+from arch.console import print_str, print_uint
+from arch.mem import read_u16, read_u32, read_u64, read_u8, write_u8
+from mm.paging import map_user
+from mm.phys import PhysAlloc
 
 comptime ET_EXEC: UInt16 = 2
 comptime EM_AARCH64: UInt16 = 183

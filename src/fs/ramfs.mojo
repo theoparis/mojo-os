@@ -9,15 +9,15 @@
 #
 # Lookup treats paths the way Linux does for an initramfs: "/init" and
 # "./init" and "init" all resolve to the same root file.
-from console import print_cstr, print_str, print_uint, putc
-from cpio import (
+from arch.console import print_cstr, print_str, print_uint, putc
+from fs.cpio import (
     CPIO_HEADER_LEN,
     CPIO_MAGIC,
     CPIO_TRAILER_NAME,
     cpio_align4,
     hex_val,
 )
-from mem import align4, cstr_eq, read_u8, write_u8
+from arch.mem import align4, cstr_eq, read_u8, write_u8
 
 comptime RAMFS_MAX = 128
 

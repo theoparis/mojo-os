@@ -2,7 +2,7 @@
 
 > **Status: implemented & selectable.** The translation granule is a build
 > option: `make PAGE_SHIFT=12` (default) = 4KB, `make PAGE_SHIFT=14` = 16KB.
-> PAGE_SHIFT (read via the `-D` build define in src/phys.mojo) drives TCR
+> PAGE_SHIFT (read via the `-D` build define in src/mm/phys.mojo) drives TCR
 > TG0, boot.S's table geometry, and paging.mojo. 16KB needs `-cpu
 > cortex-a76`/`max` (Makefile picks it automatically; boot.S checks TGran16).
 > The rest of this document records the analysis that drove the change.
@@ -67,12 +67,12 @@ TGran16 at boot before programming TCR.
     1GB range EL1-only (zeroed + filled in 512-entry loops).
 - **src/linker.ld** — the two tables live in reserved `.` + 4096 sections
   after BSS (`ALIGN(4096)`), before the kernel stack.
-- **src/paging.mojo** — user pages: converts a 2MB L2 *block* slot into a
+- **src/mm/paging.mojo** — user pages: converts a 2MB L2 *block* slot into a
   lazily-allocated L3 table of 512 x 4KB pages (`_ensure_l3`), then flips
   individual PTEs to EL0 perms. Constants: PAGE_SIZE 4096, 512 pages/slot,
   slot = 0x200000.
-- **src/phys.mojo** — `alloc_pages()` hard-codes 4KB alignment.
-- **src/elf.mojo / src/user/user.ld** — segment addresses are page-mapped
+- **src/mm/phys.mojo** — `alloc_pages()` hard-codes 4KB alignment.
+- **src/proc/elf.mojo / src/user/user.ld** — segment addresses are page-mapped
   by rounding; the clang toolchain already aligns segments to 0x10000, so
   they satisfy any of 4K/16K/64K alignment.
 
@@ -101,12 +101,12 @@ TGran16 at boot before programming TCR.
      only where user pages are needed" still works but with 32MB lumps
      (fine: everything not user-mapped stays EL1-only anyway).
 
-4. **src/paging.mojo**: PAGE_SIZE/PAGE_MASK 4096 -> 0x4000; `_ensure_l3`
+4. **src/mm/paging.mojo**: PAGE_SIZE/PAGE_MASK 4096 -> 0x4000; `_ensure_l3`
    fills 2048 identity pages of 16KB each (32MB per leaf); page index bits
    are VA[24:14]; slot constant 0x200000 -> 0x2000000. The AP/UXN perms and
    the overall map-then-copy flow are granule-independent.
 
-5. **src/phys.mojo**: `alloc_pages()` alignment 4096 -> 0x4000, and frames
+5. **src/mm/phys.mojo**: `alloc_pages()` alignment 4096 -> 0x4000, and frames
    it returns for user data/stack should become 16KB multiples too (Linux
    page sizes apply to everything below the kernel).
 

@@ -34,7 +34,7 @@ SECTIONS
         /* Kernel state shared between kmain and the syscall dispatcher
          * (brk/mmap cursors, allocator free-list head, page-table base...).
          * Lives inside .bss so boot.S zeroes it like the rest of BSS.
-         * Fields are accessed by offset from __kstate (see src/kstate.mojo). */
+         * Fields are accessed by offset from __kstate (see src/core/kstate.mojo). */
         . = ALIGN(8);
         __kstate = .;
         . += 256;
@@ -61,9 +61,9 @@ SECTIONS
      * sits just past the kernel's static image and is cleared with BSS.
      *
      * The EL0 (userspace) stack is NOT reserved here: userspace runs in the
-     * low 128MB *virtual* address space carved out by src/paging.mojo, with
+     * low 128MB *virtual* address space carved out by src/mm/paging.mojo, with
      * its stack at the top of that space (0x08000000 down) and pages mapped
-     * onto frames from the physical allocator. See src/paging.mojo. */
+     * onto frames from the physical allocator. See src/mm/paging.mojo. */
     . = ALIGN(16);
     __stack_bottom = .;
     . += 0x10000;

@@ -25,8 +25,8 @@ from std.ffi import external_call
 from std.memory.pointer import Pointer
 from std.origin import MutUntrackedOrigin
 
-from mem import read_u64, write_u64
-from phys import PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PhysAlloc
+from arch.mem import read_u64, write_u64
+from mm.phys import PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PhysAlloc
 
 # index bits per table = granule_bits - 3 (9 for 4KB, 11 for 16KB)
 comptime INDEX_BITS: Int = PAGE_SHIFT - 3
@@ -36,6 +36,12 @@ comptime SLOT_SHIFT: Int = PAGE_SHIFT + INDEX_BITS  # 21 (4KB) or 25 (16KB)
 comptime SLOT_SIZE: Int = 1 << SLOT_SHIFT
 comptime USER_VA_TOP: Int = 0x08000000  # user VAs live in [0, this)
 comptime USER_SLOTS: Int = USER_VA_TOP >> SLOT_SHIFT  # 64 (4KB) or 4 (16KB)
+
+# User process VA layout. The EL0 stack sits at the very top of the user VA
+# space and anonymous mmaps descend from just below it; brk grows up from the
+# image end and is capped at USER_HEAP_TOP, so brk and mmap never collide.
+comptime USER_STACK_SIZE: Int = 0x10000  # 64KB initial user stack
+comptime USER_HEAP_TOP: Int = 0x04000000  # brk cap == mmap floor (64MB)
 
 # descriptor bits (stage 1, format identical across granules)
 comptime D_PAGE: UInt64 = 0x3  # page descriptor (leaf)

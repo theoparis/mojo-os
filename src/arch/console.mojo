@@ -8,7 +8,7 @@ from std.collections.array import Array
 from std.collections.string.string_span import StringSpan
 from std.format import Writer
 
-from mem import mmio_read_u32, mmio_write_u32, read_u8
+from arch.mem import mmio_read_u32, mmio_write_u32, read_u8
 
 comptime FR_TXFF: UInt32 = 0x20
 comptime FR_RXFE: UInt32 = 0x10
