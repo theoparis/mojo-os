@@ -4,12 +4,31 @@ LLD          ?= ld.lld
 # plugin for `-none-` target triples, so `debug_assert`/`abort` work without
 # libc. The stock nix-packaged mojo does not have this patch.
 WORK         := work/modular
-MOJO         ?= $(WORK)/bazel-bin/Mojo/tools/mojo/mojo
-MOJO_STDLIB  ?= $(WORK)/Mojo/stdlib
-# The Mojo CompilerRT shared library, needed only when building/running
-# *host* mojo programs (like the mkcpio tool); the bare-metal kernel build
-# links against our own freestanding runtime instead.
-COMPILER_RT  := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
+PATCHED_MOJO := $(WORK)/bazel-bin/Mojo/tools/mojo/mojo
+PATCHED_RT   := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
+
+# Prefer the patched Mojo build (auto-selects the baremetal stdlib plugin for
+# `-none-` targets, so debug_assert/abort work without libc). When it isn't
+# built yet, fall back to a system/pixi Mojo and compensate with
+# -DASSERT=none (the baremetal plugin is what makes asserts usable).
+ifeq ($(wildcard $(PATCHED_MOJO)),)
+  MOJO         ?= mojo
+  MOJO_STDLIB  ?=
+  MOJO_ASSERT  ?= -DASSERT=none
+  # System Mojo ships CompilerRT next to the binary and finds it via rpath
+  # (it only needed an explicit path for the patched build's host tools).
+  COMPILER_RT  ?=
+else
+  MOJO         ?= $(PATCHED_MOJO)
+  MOJO_STDLIB  ?= $(WORK)/Mojo/stdlib
+  MOJO_ASSERT  ?=
+  COMPILER_RT  ?= $(PATCHED_RT)
+endif
+
+# Only pass -mojo-search-paths when an explicit stdlib tree is configured;
+# an empty value makes the driver treat the next argument as an input file.
+MOJO_SEARCH  := $(if $(MOJO_STDLIB),-mojo-search-paths $(MOJO_STDLIB),)
+MOJO_RT_ENV  := $(if $(COMPILER_RT),MODULAR_MOJO_MAX_COMPILERRT_PATH=$(COMPILER_RT),)
 QEMU         ?= qemu-system-aarch64
 OBJCOPY      ?= llvm-objcopy
 
@@ -28,7 +47,7 @@ PAGE_SHIFT   ?= 12
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -DPAGE_SHIFT=$(PAGE_SHIFT) -c
-MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) -mojo-search-paths $(MOJO_STDLIB) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 # Freestanding userspace binaries are compiled with clang for a bare
 # `-none-` triple (no OS, no libc) and linked as static non-PIE ET_EXEC by
@@ -75,8 +94,7 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 # Build the cpio writer as a native (host) mojo executable. Needs the host
 # Mojo CompilerRT (set via env) -- the bare-metal kernel build does not.
 $(MKCPIO): tools/mkcpio.mojo src/cpio.mojo | $(BUILD_DIR)
-	MODULAR_MOJO_MAX_COMPILERRT_PATH=$(COMPILER_RT) \
-		$(MOJO) build -mojo-search-paths $(MOJO_STDLIB) -I src \
+	$(MOJO_RT_ENV) $(MOJO) build $(MOJO_SEARCH) -I src \
 		tools/mkcpio.mojo -o $@
 
 # /init for the ramfs: a tiny freestanding ELF that does raw Linux syscalls.
@@ -87,7 +105,7 @@ $(INIT_ELF): src/user/init.c src/user/user.ld | $(BUILD_DIR)
 
 # The cpio initrd that QEMU loads and the kernel unpacks at boot.
 $(INITRD): $(MKCPIO) $(INIT_ELF)
-	LD_LIBRARY_PATH=$(dir $(COMPILER_RT)) $(MKCPIO) $@ $(INITRD_ENTRIES)
+	$(if $(COMPILER_RT),LD_LIBRARY_PATH=$(dir $(COMPILER_RT)),) $(MKCPIO) $@ $(INITRD_ENTRIES)
 
 userspace: $(INITRD)
 
