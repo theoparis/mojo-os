@@ -14,15 +14,20 @@ from proc.cmdline import MAX_ARGV
 def build_user_stack(
     top: Int, entry: Int, phdr: Int, phnum: Int, argc: Int, argaddrs: Int
 ) -> Int:
-    """Lay out an initial Linux process stack (argc/argv/envp/auxv) in the
-    mapped stack region just below `top` and return the initial sp.
+    """Lay out a Darwin / XNU user process stack in the mapped stack region
+    below `top` and return the initial sp.
 
-    `argc` argv strings (each NUL-terminated) are copied out of the kernel
-    argv list at `argaddrs` (an array of `argc` u64 kernel addresses, as
-    built by cmdline.collect_argv) into the user stack region.
+    Darwin 64-bit initial stack ABI (XNU kern_exec.c: exec_copyout_strings):
+      [sp]                  = argc (64-bit)
+      [sp + 8 ..]           = argv[0..argc-1] (64-bit pointers)
+      [sp + 8*(argc+1)]     = NULL (argv terminator)
+      [sp + 8*(argc+2) ..]  = envp[0..envc-1] (64-bit pointers)
+      [sp + ...]            = NULL (envp terminator)
+      [sp + ...]            = apple[0..applec-1] (executable path etc.)
+      [sp + ...]            = NULL (apple terminator)
+      Strings and executable path follow the pointers.
     """
-    var s = (top - 0x300) & ~15
-    # 1) copy each argv string (kernel -> user), remembering the user addrs
+    # 1) Copy string data down from top
     var strp = top - 0x200
     var uaddrs = Array[Int, MAX_ARGV](uninitialized=True)
     for i in range(argc):
@@ -37,47 +42,46 @@ def build_user_stack(
                 break
         uaddrs[i] = strp
         strp = d
-    # AT_RANDOM: 16 zero bytes right after the strings
-    for i in range(16):
-        write_u8(strp + i, 0)
-    var rnd = strp
-    strp += 16
 
-    # 2) arrays from s: argc, argv[], NULL, envp NULL, auxv pairs, AT_NULL
+    # Also place an exec_path string for apple[0]
+    var exec_path_addr = strp
+    write_u8(exec_path_addr + 0, 0x2F)  # '/'
+    write_u8(exec_path_addr + 1, 0x69)  # 'i'
+    write_u8(exec_path_addr + 2, 0x6E)  # 'n'
+    write_u8(exec_path_addr + 3, 0x69)  # 'i'
+    write_u8(exec_path_addr + 4, 0x74)  # 't'
+    write_u8(exec_path_addr + 5, 0)  # NUL
+    strp += 8
+
+    # 2) Lay out pointer arrays aligned to 16 bytes:
+    # argc (8 bytes) + argv (8*argc) + NULL (8) + envp (NULL, 8) + apple (exec_path, NULL, 16)
+    # Total pointers count = 1 + argc + 1 + 1 + 2 = argc + 5 words = (argc + 5)*8 bytes
+    var total_words = 1 + argc + 1 + 1 + 2
+    var total_bytes = total_words * 8
+    var s = (top - 0x300 - total_bytes) & ~15
+
     var p = s
+    # [sp] = argc
     write_u64(p, UInt64(argc))
     p += 8
+
+    # argv pointers
     for i in range(argc):
         write_u64(p, UInt64(uaddrs[i]))
         p += 8
-    write_u64(p, 0)  # argv terminator
+    write_u64(p, 0)  # argv NULL terminator
     p += 8
-    write_u64(p, 0)  # envp terminator (no environment yet)
+
+    # envp pointers (empty for now)
+    write_u64(p, 0)  # envp NULL terminator
     p += 8
-    write_u64(p, 6)  # AT_PAGESZ
+
+    # apple array: apple[0] = exec_path, followed by NULL
+    write_u64(p, UInt64(exec_path_addr))
     p += 8
-    write_u64(p, UInt64(PAGE_SIZE))
+    write_u64(p, 0)  # apple NULL terminator
     p += 8
-    write_u64(p, 25)  # AT_RANDOM
-    p += 8
-    write_u64(p, UInt64(rnd))
-    p += 8
-    if phdr > 0:
-        write_u64(p, 3)  # AT_PHDR
-        p += 8
-        write_u64(p, UInt64(phdr))
-        p += 8
-        write_u64(p, 4)  # AT_PHENT
-        p += 8
-        write_u64(p, 56)
-        p += 8
-        write_u64(p, 5)  # AT_PHNUM
-        p += 8
-        write_u64(p, UInt64(phnum))
-        p += 8
-    write_u64(p, 0)  # AT_NULL
-    p += 8
-    write_u64(p, 0)
+
     return s
 
 

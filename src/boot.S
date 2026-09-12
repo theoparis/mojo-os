@@ -426,20 +426,56 @@ el0_sync:
     b.ne    .Lel0_fault
 
     // Load the syscall arguments and call the Mojo syscall dispatcher.
-    // Kernel calling convention: x0 = nr, x1..x6 = args (user x8, x0..x5).
-    ldr     x0, [sp, #64]   // syscall number (user x8)
+    // Darwin/XNU ARM64 calling convention:
+    // syscall / Mach trap number is in x16 (sp + 128)
+    // arguments in x0..x5 (sp + 0..40)
+    // Also support user passing number in x8 (sp + 64) if x16 is 0.
+    ldr     x0, [sp, #128]  // user x16
+    cbnz    x0, .Lhave_nr
+    ldr     x0, [sp, #64]   // fallback to user x8 if x16 is 0
+.Lhave_nr:
     ldr     x1, [sp, #0]    // a0
     ldr     x2, [sp, #8]    // a1
     ldr     x3, [sp, #16]   // a2
-    ldr     x4, [sp, #24]
-    ldr     x5, [sp, #32]
-    ldr     x6, [sp, #40]
+    ldr     x4, [sp, #24]   // a3
+    ldr     x5, [sp, #32]   // a4
+    ldr     x6, [sp, #40]   // a5
+    add     x7, sp, #280    // pointer to temporary error flag on stack
+    str     xzr, [x7]
     bl      ksyscall
     str     x0, [sp, #0]    // return value lands in user x0
+
+    // Check error flag returned by dispatcher
+    ldr     x1, [sp, #280]
+    cbz     x1, .Lclear_carry
+    // Error: set PSR64 carry flag (bit 29) in saved spsr_el1
+    ldr     x2, [sp, #264]
+    orr     x2, x2, #(1 << 29)
+    str     x2, [sp, #264]
+    b       .Lel0_return
+.Lclear_carry:
+    // Success: clear PSR64 carry flag (bit 29) in saved spsr_el1
+    ldr     x2, [sp, #264]
+    bic     x2, x2, #(1 << 29)
+    str     x2, [sp, #264]
     b       .Lel0_return
 
 .Lel0_fault:
     adr     x0, msg_el0_fault
+    bl      uart_puts
+    adr     x0, msg_elr
+    bl      uart_puts
+    ldr     x0, [sp, #256]
+    bl      uart_puthex
+    adr     x0, msg_exc
+    bl      uart_puts
+    ldr     x0, [sp, #272]
+    bl      uart_puthex
+    adr     x0, msg_far
+    bl      uart_puts
+    mrs     x0, far_el1
+    bl      uart_puthex
+    adr     x0, msg_nl
     bl      uart_puts
     b       .Lexc_halt
 
@@ -474,6 +510,14 @@ el0_sync:
 launch_el0:
     msr     sp_el0, x1
     msr     elr_el1, x0
+    // Standard Darwin entry convention:
+    // x0 = argc (from [sp_el0])
+    // x1 = argv (sp_el0 + 8)
+    // x2 = envp (sp_el0 + 8 + (argc+1)*8)
+    // x3 = apple
+    ldr     x0, [x1, #0]       // argc
+    add     x2, x1, #8         // argv
+    mov     x1, x2             // argv into x1
     mov     x2, #0x3C0         // SPSR: DAIF masked, EL0t
     msr     spsr_el1, x2
     isb

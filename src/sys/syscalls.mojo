@@ -1,93 +1,137 @@
-# Implementations of the individual syscalls that manipulate user memory
-# (brk, mmap, getrandom, clock_gettime, uname).
+# Darwin / XNU system call and Mach VM handlers.
 #
-# ksyscall in sys/dispatch.mojo dispatches to these; keeping them separate
-# from the dispatcher keeps the (long) syscall-number switch readable.
-from std.memory.pointer import Pointer
-from std.origin import MutUntrackedOrigin
-
-from arch.console import print_str
-from arch.mem import copy_lit, write_u8
-from core.kstate import brk_cur, mmap_next, set_brk, set_mmap_next, user_map
-from mm.paging import USER_HEAP_TOP, USER_VA_TOP
-from mm.phys import PAGE_SIZE
-from sys.syscall_nr import E_INVAL, E_MEM, E_NOSYS
-
-
-def sys_brk(addr: Int) -> UInt64:
-    """brk(addr): set/query the program break. Pages between the old and new
-    break are mapped EL0 read/write on demand (no reclaim on shrink), capped
-    below the top of the user heap region."""
-    var cur = brk_cur()
-    if addr == 0:
-        return UInt64(cur)
-    if addr <= cur:
-        set_brk(addr)
-        return UInt64(addr)
-    # Grow: cap at the top of the low heap region, well below the stack.
-    if addr > USER_HEAP_TOP:
-        return E_MEM
-    if not user_map(cur, addr - cur, False):
-        return E_MEM
-    set_brk(addr)
-    return UInt64(addr)
+# Memory allocators and system information queries compatible with Darwin.
+from arch.mem import read_u64, write_u32, write_u64, write_u8
+from core.kstate import (
+    OFF_BRK,
+    OFF_FREE_HEAD,
+    OFF_L1,
+    OFF_MMAP,
+    OFF_RAM_BASE,
+    OFF_RAM_END,
+    get64,
+    set64,
+    set_brk,
+    set_mmap_next,
+)
+from mm.paging import map_user
+from mm.phys import PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PhysAlloc
+from sys.syscall_nr import (
+    DARWIN_EFAULT,
+    DARWIN_EINVAL,
+    DARWIN_ENOMEM,
+    KERN_INVALID_ADDRESS,
+    KERN_INVALID_ARGUMENT,
+    KERN_NO_SPACE,
+    KERN_SUCCESS,
+)
 
 
-def sys_mmap(addr: Int, length: Int, prot: Int, flags: Int, fd: Int) -> UInt64:
-    """mmap(addr, length, prot, flags, fd, offset): anonymous mappings only.
-
-    Maps *virtual* addresses in the low user VA space onto fresh physical
-    frames (read/write, executable if PROT_EXEC). A NULL addr carves a
-    region from the TOP of the user VA space downward (mmap_next, just
-    below the EL0 stack) so it never collides with brk, which grows up from
-    the image end and is capped at USER_HEAP_TOP. MAP_FIXED maps at the
-    requested address instead."""
+def sys_darwin_mmap(
+    addr: Int,
+    length: Int,
+    prot: Int,
+    flags: Int,
+    fd: Int,
+    offset: Int,
+    mut is_err: Bool,
+) -> UInt64:
+    """Implement Darwin mmap. Returns mapped address or errno."""
     if length <= 0:
-        return E_INVAL
-    var anon = (flags & 0x20) != 0
-    if not anon or fd != -1:
-        print_str("[mmap] only MAP_ANONYMOUS (fd=-1) is supported\n")
-        return E_NOSYS
-    var page = PAGE_SIZE
-    var nbytes = (length + page - 1) & ~(page - 1)
-    var fixed = (flags & 0x10) != 0  # MAP_FIXED
-    var base: Int
-    if fixed:
-        base = (addr + page - 1) & ~(page - 1)
-    else:
-        base = mmap_next() - nbytes
-    if base < 0x10000 or base + nbytes > USER_VA_TOP:
-        return E_MEM
-    if not fixed and base < USER_HEAP_TOP:
-        return E_MEM  # don't descend into the brk region
-    var exec = (prot & 1) != 0
-    if not user_map(base, nbytes, exec):
-        return E_MEM
-    if not fixed:
-        set_mmap_next(base)
-    return UInt64(base)
+        is_err = True
+        return DARWIN_EINVAL
+
+    var alloc = PhysAlloc()
+    alloc.free_head = get64(OFF_FREE_HEAD)
+    alloc.ram_base = get64(OFF_RAM_BASE)
+    alloc.ram_end = get64(OFF_RAM_END)
+
+    var l1 = Int(get64(OFF_L1))
+    var cur = Int(get64(OFF_MMAP))
+    var aligned_len = (length + PAGE_MASK) & ~PAGE_MASK
+    var target = cur - aligned_len
+
+    var brk_val = Int(get64(OFF_BRK))
+    if target <= brk_val:
+        is_err = True
+        return DARWIN_ENOMEM
+
+    # Darwin PROT_EXEC is 0x4
+    var exec = (prot & 0x4) != 0
+    if not map_user(alloc, l1, target, aligned_len, exec):
+        is_err = True
+        return DARWIN_ENOMEM
+
+    set_mmap_next(target)
+    set64(OFF_FREE_HEAD, alloc.free_head)
+    is_err = False
+    return UInt64(target)
 
 
-def sys_getrandom(buf: Int, count: Int) -> UInt64:
-    for i in range(count):
-        write_u8(buf + i, 0)
-    return UInt64(count)
+def mach_vm_allocate(
+    target_task: UInt64,
+    addr_ptr: Int,
+    size: UInt64,
+    flags: UInt64,
+) -> UInt64:
+    """Mach trap: allocate zero-filled virtual memory for a task."""
+    if size == 0:
+        return KERN_INVALID_ARGUMENT
+
+    var alloc = PhysAlloc()
+    alloc.free_head = get64(OFF_FREE_HEAD)
+    alloc.ram_base = get64(OFF_RAM_BASE)
+    alloc.ram_end = get64(OFF_RAM_END)
+
+    var l1 = Int(get64(OFF_L1))
+    var cur = Int(get64(OFF_MMAP))
+    var aligned_len = (Int(size) + PAGE_MASK) & ~PAGE_MASK
+    var target = cur - aligned_len
+
+    var brk_val = Int(get64(OFF_BRK))
+    if target <= brk_val:
+        return KERN_NO_SPACE
+
+    if not map_user(alloc, l1, target, aligned_len, False):
+        return KERN_NO_SPACE
+
+    set_mmap_next(target)
+    set64(OFF_FREE_HEAD, alloc.free_head)
+
+    # Write back allocated address to user pointer
+    if addr_ptr != 0:
+        write_u64(addr_ptr, UInt64(target))
+
+    return KERN_SUCCESS
 
 
-def sys_clock_gettime(buf: Int):
-    # { time_t tv_sec; long tv_nsec; } both zero. Avoids crashing callers.
-    var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
-        unsafe_from_address=buf
-    )
-    p[] = 0
-    p[unsafe_offset=1] = 0
+def mach_vm_deallocate(
+    target_task: UInt64,
+    address: UInt64,
+    size: UInt64,
+) -> UInt64:
+    """Mach trap: deallocate virtual memory range (stub accepted)."""
+    return KERN_SUCCESS
 
 
-def sys_uname(buf: Int):
-    """uname: fill a Linux struct utsname (6 x char[65], 390 bytes)."""
-    copy_lit(buf + 0, "mojo-os")  # sysname
-    copy_lit(buf + 65, "mojo-os")  # nodename
-    copy_lit(buf + 130, "1.0.0")  # release
-    copy_lit(buf + 195, "mojo-os 1.0.0")  # version
-    copy_lit(buf + 260, "aarch64")  # machine
-    copy_lit(buf + 325, "(none)")  # domainname
+def mach_timebase_info(info_ptr: Int) -> UInt64:
+    """mach_timebase_info_trap: returns numer/denom ratio for ticks to nanoseconds.
+    """
+    if info_ptr == 0:
+        return KERN_INVALID_ARGUMENT
+    # 1/1 ratio (nanoseconds direct)
+    write_u32(info_ptr + 0, 1)  # numer
+    write_u32(info_ptr + 4, 1)  # denom
+    return KERN_SUCCESS
+
+
+def sys_darwin_gettimeofday(tp: Int, tzp: Int) -> UInt64:
+    """BSD gettimeofday(struct timeval *tp, struct timezone *tzp)."""
+    if tp != 0:
+        write_u64(tp + 0, 1700000000)  # tv_sec
+        write_u32(tp + 8, 0)  # tv_usec
+        write_u32(tp + 12, 0)
+    if tzp != 0:
+        write_u32(tzp + 0, 0)
+        write_u32(tzp + 4, 0)
+    return 0

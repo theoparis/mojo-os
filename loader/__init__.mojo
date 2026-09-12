@@ -1,4 +1,4 @@
-# Freestanding ELF loader package.
+# Freestanding ELF and Mach-O loader package.
 # Shared across baremetal OS kernel and UEFI bootloader.
 from .elf import (
     EI_ABIVERSION,
@@ -59,4 +59,41 @@ from .elf import (
     elf_read_u32,
     elf_read_u64,
     elf_write_u8,
+)
+from .macho import (
+    ARM_THREAD_STATE64,
+    CPU_TYPE_ARM64,
+    CPU_TYPE_X86_64,
+    LC_DYLD_CHAINED_FIXUPS,
+    LC_LOAD_DYLIB,
+    LC_LOAD_DYLINKER,
+    LC_MAIN,
+    LC_SEGMENT_64,
+    LC_UNIXTHREAD,
+    MH_CIGAM_64,
+    MH_EXECUTE,
+    MH_MAGIC_64,
+    VM_PROT_EXECUTE,
+    VM_PROT_READ,
+    VM_PROT_WRITE,
+    X86_THREAD_STATE64,
+    entry_point_command,
+    load_command,
+    mach_header_64,
+    macho_cputype,
+    macho_find_chained_fixups,
+    macho_find_entry,
+    macho_find_symtab,
+    macho_image_end,
+    macho_is_valid,
+    macho_lookup_symbol,
+    macho_ncmds,
+    macho_read_u16,
+    macho_read_u32,
+    macho_read_u64,
+    macho_read_u8,
+    macho_sizeofcmds,
+    macho_write_u64,
+    macho_write_u8,
+    segment_command_64,
 )

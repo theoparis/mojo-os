@@ -291,26 +291,50 @@ comptime STAT_TS: UInt64 = 1700000000
 
 @always_inline
 def _put_stat(ubuf: Int, mode: UInt64, size: Int, ino: UInt64):
-    write_u64(ubuf + 0, 0)  # st_dev
+    # Darwin struct user64_stat64 (XNU /usr/include/sys/stat.h):
+    # dev_t     st_dev          (4 bytes, +0)
+    # mode_t    st_mode         (2 bytes, +4)
+    # nlink_t   st_nlink        (2 bytes, +6)
+    # ino64_t   st_ino          (8 bytes, +8)
+    # uid_t     st_uid          (4 bytes, +16)
+    # gid_t     st_gid          (4 bytes, +20)
+    # dev_t     st_rdev         (4 bytes, +24)
+    #           [4 bytes pad]
+    # timespec  st_atimespec    (16 bytes: 8s + 8ns, +32)
+    # timespec  st_mtimespec    (16 bytes, +48)
+    # timespec  st_ctimespec    (16 bytes, +64)
+    # timespec  st_birthtimespec(16 bytes, +80)
+    # off_t     st_size         (8 bytes, +96)
+    # blkcnt_t  st_blocks       (8 bytes, +104)
+    # blksize_t st_blksize      (4 bytes, +112)
+    # uint32_t  st_flags        (4 bytes, +116)
+    # uint32_t  st_gen          (4 bytes, +120)
+    # int32_t   st_lspare       (4 bytes, +124)
+    # int64_t   st_qspare[2]    (16 bytes, +128)
+    write_u32(ubuf + 0, 0)  # st_dev
+    write_u16(ubuf + 4, UInt16(mode & 0xFFFF))  # st_mode
+    write_u16(ubuf + 6, 1)  # st_nlink
     write_u64(ubuf + 8, ino)  # st_ino
-    write_u32(ubuf + 16, UInt32(mode & 0xFFFFFFFF))  # st_mode
-    write_u32(ubuf + 20, 1)  # st_nlink
-    write_u32(ubuf + 24, 0)  # st_uid
-    write_u32(ubuf + 28, 0)  # st_gid
-    write_u64(ubuf + 32, 0)  # st_rdev
-    write_u64(ubuf + 40, 0)  # __pad1
-    write_u64(ubuf + 48, UInt64(size))  # st_size
-    write_u32(ubuf + 56, 4096)  # st_blksize
-    write_u32(ubuf + 60, 0)  # __pad2
-    write_u64(ubuf + 64, UInt64((size + 511) // 512))  # st_blocks
-    write_u64(ubuf + 72, STAT_TS)  # st_atime
-    write_u64(ubuf + 80, 0)  # st_atime_nsec
-    write_u64(ubuf + 88, STAT_TS)  # st_mtime
-    write_u64(ubuf + 96, 0)  # st_mtime_nsec
-    write_u64(ubuf + 104, STAT_TS)  # st_ctime
-    write_u64(ubuf + 112, 0)  # st_ctime_nsec
-    write_u32(ubuf + 120, 0)
-    write_u32(ubuf + 124, 0)
+    write_u32(ubuf + 16, 0)  # st_uid
+    write_u32(ubuf + 20, 0)  # st_gid
+    write_u32(ubuf + 24, 0)  # st_rdev
+    write_u32(ubuf + 28, 0)  # pad
+    write_u64(ubuf + 32, STAT_TS)  # st_atime
+    write_u64(ubuf + 40, 0)  # st_atimensec
+    write_u64(ubuf + 48, STAT_TS)  # st_mtime
+    write_u64(ubuf + 56, 0)  # st_mtimensec
+    write_u64(ubuf + 64, STAT_TS)  # st_ctime
+    write_u64(ubuf + 72, 0)  # st_ctimensec
+    write_u64(ubuf + 80, STAT_TS)  # st_birthtime
+    write_u64(ubuf + 88, 0)  # st_birthtimensec
+    write_u64(ubuf + 96, UInt64(size))  # st_size
+    write_u64(ubuf + 104, UInt64((size + 511) // 512))  # st_blocks
+    write_u32(ubuf + 112, 4096)  # st_blksize
+    write_u32(ubuf + 116, 0)  # st_flags
+    write_u32(ubuf + 120, 0)  # st_gen
+    write_u32(ubuf + 124, 0)  # st_lspare
+    write_u64(ubuf + 128, 0)  # st_qspare[0]
+    write_u64(ubuf + 136, 0)  # st_qspare[1]
 
 
 def stat_node(base: Int, node: Int, ubuf: Int):

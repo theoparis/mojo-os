@@ -4,7 +4,7 @@ LLD_LINK     ?= lld-link
 # Custom-built mojo (work/modular) that auto-selects the "baremetal" stdlib
 # plugin for `-none-` target triples, so `debug_assert`/`abort` work without
 # libc. The stock nix-packaged mojo does not have this patch.
-WORK         := work/modular
+WORK         := /home/theo/src/modular
 PATCHED_MOJO := $(WORK)/bazel-bin/Mojo/tools/mojo/mojo
 PATCHED_RT   := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
 
@@ -12,19 +12,10 @@ PATCHED_RT   := $(WORK)/bazel-bin/Mojo/libKGENCompilerRTShared.so
 # `-none-` targets, so debug_assert/abort work without libc). When it isn't
 # built yet, fall back to a system/pixi Mojo and compensate with
 # -DASSERT=none (the baremetal plugin is what makes asserts usable).
-ifeq ($(wildcard $(PATCHED_MOJO)),)
-  MOJO         ?= mojo
-  MOJO_STDLIB  ?=
-  MOJO_ASSERT  ?= -DASSERT=none
-  # System Mojo ships CompilerRT next to the binary and finds it via rpath
-  # (it only needed an explicit path for the patched build's host tools).
-  COMPILER_RT  ?=
-else
-  MOJO         ?= $(PATCHED_MOJO)
-  MOJO_STDLIB  ?= $(WORK)/Mojo/stdlib
-  MOJO_ASSERT  ?=
-  COMPILER_RT  ?= $(PATCHED_RT)
-endif
+MOJO         := $(PATCHED_MOJO)
+MOJO_STDLIB  := $(WORK)/Mojo/stdlib
+MOJO_ASSERT  ?= -DASSERT=none
+COMPILER_RT  := $(PATCHED_RT)
 
 # Only pass -mojo-search-paths when an explicit stdlib tree is configured;
 # an empty value makes the driver treat the next argument as an input file.
@@ -91,10 +82,13 @@ OVMF_CODE        ?= $(firstword $(wildcard /usr/share/edk2/x64/OVMF.4m.fd /usr/s
 
 INIT_ELF     := $(BUILD_DIR)/init
 INITRD       := $(BUILD_DIR)/initrd.cpio
-MKCPIO       := $(BUILD_DIR)/mkcpio
+MKCPIO       := $(MOJO_RT_ENV) $(MOJO) run $(MOJO_SEARCH) -I src tools/mkcpio.mojo
 
 # User-space binaries to bundle into the initrd, as archive-name=path pairs.
-INITRD_ENTRIES := init=$(INIT_ELF)
+INIT_MACHO    := $(BUILD_DIR)/init_macho
+INIT_DYLIB    := $(BUILD_DIR)/libSystem.B.dylib
+
+INITRD_ENTRIES := init=$(INIT_MACHO) usr/lib/libSystem.B.dylib=$(INIT_DYLIB) usr/lib/libSystem.dylib=$(INIT_DYLIB)
 
 .PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi
 
@@ -160,21 +154,30 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 # Userspace + initrd (Linux-style boot target)
 # ------------------------------------------------------------------------
 
-# Build the cpio writer as a native (host) mojo executable. Needs the host
-# Mojo CompilerRT (set via env) -- the bare-metal kernel build does not.
-$(MKCPIO): tools/mkcpio.mojo src/fs/cpio.mojo | $(BUILD_DIR)
-	$(MOJO_RT_ENV) $(MOJO) build $(MOJO_SEARCH) -I src \
-		tools/mkcpio.mojo -o $@
-
-# /init for the ramfs: a tiny freestanding ELF that does raw Linux syscalls.
+# /init for the ramfs: a tiny freestanding binary that tests Darwin syscalls & Mach traps.
 $(INIT_ELF): src/user/init.c src/user/user.ld | $(BUILD_DIR)
 	$(USER_CC) --target=$(USER_TARGET) -ffreestanding -fno-builtin -fuse-ld=lld \
 		-nostdlib -static -fno-pie -O2 -Wall \
 		-Wl,-T,src/user/user.ld -o $@ $<
 
+# Build the dynamic macOS arm64 libSystem.dylib written in Mojo
+$(INIT_DYLIB): src/user/libsystem.mojo | $(BUILD_DIR)
+	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) --target-triple=arm64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem.o
+	ld64.lld -arch arm64 -platform_version macos 11.0 11.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem.o -o $@
+	ln -sf libSystem.B.dylib $(BUILD_DIR)/libSystem.dylib
+
+$(INIT_MACHO): src/user/init.c $(INIT_DYLIB) | $(BUILD_DIR)
+	clang --target=aarch64-apple-darwin -fuse-ld=lld \
+		-fno-stack-protector \
+		-Wl,-platform_version,macos,11.0,11.0 \
+		-Wl,-pagezero_size,0x10000 \
+		-Wl,-fixup_chains \
+		-L$(BUILD_DIR) -lSystem \
+		src/user/init.c -o $@
+
 # The cpio initrd that QEMU loads and the kernel unpacks at boot.
-$(INITRD): $(MKCPIO) $(INIT_ELF)
-	$(if $(COMPILER_RT),LD_LIBRARY_PATH=$(dir $(COMPILER_RT)),) $(MKCPIO) $@ $(INITRD_ENTRIES)
+$(INITRD): tools/mkcpio.mojo src/fs/cpio.mojo $(INIT_MACHO) $(INIT_DYLIB)
+	$(MKCPIO) $@ $(INITRD_ENTRIES)
 
 userspace: $(INITRD)
 

@@ -145,7 +145,8 @@ def elf_write_u8(addr: Int, val: UInt8):
 # Validation & Header Field Inspection
 # ------------------------------------------------------------------------
 def elf_is_valid(base: Int) -> Bool:
-    """Check that the memory at `base` contains a valid ELF64 little-endian binary."""
+    """Check that the memory at `base` contains a valid ELF64 little-endian binary.
+    """
     if elf_read_u8(base + 0) != ELFMAG0:
         return False
     if elf_read_u8(base + 1) != ELFMAG1:
@@ -232,7 +233,8 @@ def elf_image_end(base: Int) -> Int:
 def elf_load_bounds(
     base: Int, mut min_addr: UInt64, mut max_addr: UInt64
 ) -> Bool:
-    """Find the memory extent [min_addr, max_addr) covering all PT_LOAD segments."""
+    """Find the memory extent [min_addr, max_addr) covering all PT_LOAD segments.
+    """
     if not elf_is_valid(base):
         return False
     var phoff = Int(elf_phoff(base))

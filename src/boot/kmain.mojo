@@ -32,7 +32,14 @@ from mm.paging import (
 )
 from mm.phys import PhysAlloc
 from proc.cmdline import collect_argv
-from proc.elf import elf_image_end, elf_phdrs, load_elf
+from proc.elf import elf_image_end, elf_is_valid, elf_phdrs, load_elf
+from proc.macho import (
+    load_macho,
+    load_macho_dylib,
+    macho_bind_fixups,
+    macho_image_end,
+    macho_is_valid,
+)
 from proc.userproc import build_user_stack, run_user
 
 
@@ -182,10 +189,37 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
             print_str(")\n")
 
             var fdata = fs.data_addr(idx)
-            var imgend = elf_image_end(fdata)
-            var phdr = elf_phdrs(fdata)
-            var phnum = Int(read_u16(fdata + 56))
-            var entry = load_elf(alloc, l1base, fdata)
+            var entry: Int = 0
+            var imgend: Int = 0
+            var phdr: Int = 0
+            var phnum: Int = 0
+
+            if macho_is_valid(fdata):
+                print_str("[loader] detected Mach-O binary for /init\n")
+                imgend = macho_image_end(fdata)
+                entry = load_macho(alloc, l1base, fdata)
+
+                # Look for dynamic library in ramfs: /usr/lib/libSystem.B.dylib
+                var sys_idx = fs.lookup("/usr/lib/libSystem.B.dylib")
+                if sys_idx >= 0:
+                    var sys_data = fs.data_addr(sys_idx)
+                    var sys_slide: Int = 0x200000  # Map libSystem at 2MB VA
+                    if load_macho_dylib(alloc, l1base, sys_data, sys_slide):
+                        print_str("[loader] mapped libSystem @ 0x")
+                        print_uint(UInt64(sys_slide), 16)
+                        print_str("\n")
+                        macho_bind_fixups(fdata, sys_data, UInt64(sys_slide))
+                        print_str(
+                            "[loader] chained fixups bound successfully\n"
+                        )
+            elif elf_is_valid(fdata):
+                print_str("[loader] detected ELF binary for /init\n")
+                imgend = elf_image_end(fdata)
+                phdr = elf_phdrs(fdata)
+                phnum = Int(read_u16(fdata + 56))
+                entry = load_elf(alloc, l1base, fdata)
+            else:
+                print_str("[loader] unknown executable format\n")
 
             if entry != 0 and mem.n() >= 1:
                 # EL0 stack at the top of the user VA space, growing down.

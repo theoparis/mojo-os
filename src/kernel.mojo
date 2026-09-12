@@ -68,9 +68,17 @@ def ksyscall(
     a3: UInt64,
     a4: UInt64,
     a5: UInt64,
+    err_out: Int,
 ) abi("C") -> UInt64:
-    """EL0 trap entry: delegate to the syscall dispatcher."""
-    return dispatch(n, a0, a1, a2, a3, a4, a5)
+    """EL0 trap entry: delegate to Darwin syscall / Mach trap dispatcher."""
+    var is_error: Bool = False
+    var res = dispatch(n, a0, a1, a2, a3, a4, a5, is_error)
+    if err_out != 0:
+        var p = Pointer[mut=True, T=UInt64, origin=MutUntrackedOrigin](
+            unsafe_from_address=err_out
+        )
+        p[] = 1 if is_error else 0
+    return res
 
 
 @export("kmain")
