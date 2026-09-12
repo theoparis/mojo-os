@@ -274,10 +274,20 @@ setup_mmu:
     str     x0, [x21, #24]
 #endif
 
+    // TCR cannot be changed underneath firmware's live TTBR: the old table
+    // would immediately be interpreted using our new granule/geometry.
+    // The loader invokes us through an identity mapping, so briefly disable
+    // translation while replacing the complete EL1 translation regime.
+    dsb     sy
+    mrs     x0, sctlr_el1
+    bic     x0, x0, #(1 << 0)   // M
+    bic     x0, x0, #(1 << 2)   // C
+    bic     x0, x0, #(1 << 12)  // I
+    msr     sctlr_el1, x0
+    isb
+
     // Publish page-table writes before replacing the firmware's TTBR0.
-    // This is essential when entered from UEFI: its caches may otherwise
-    // retain the zeroed BSS lines while the page-table walker sees RAM.
-    dsb     ishst
+    dsb     sy
     ldr     x0, =MAIR_VALUE
     msr     mair_el1, x0
     ldr     x0, =TCR_VALUE
