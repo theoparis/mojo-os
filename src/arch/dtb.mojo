@@ -20,6 +20,7 @@ comptime FDT_NOP: UInt32 = 4
 comptime FDT_END: UInt32 = 9
 
 comptime MEM_MAX: Int = 4
+comptime VIRTIO_MMIO_MAX: Int = 8
 
 
 struct BootParams:
@@ -33,6 +34,8 @@ struct BootParams:
     var has_initrd: Bool
     var cmdline_addr: Int
     var cmdline_len: Int
+    var virtio_mmio_count: Int
+    var virtio_mmio_bases: Array[UInt64, VIRTIO_MMIO_MAX]
 
     def __init__(out self):
         self.has_dtb = False
@@ -43,6 +46,8 @@ struct BootParams:
         self.has_initrd = False
         self.cmdline_addr = 0
         self.cmdline_len = 0
+        self.virtio_mmio_count = 0
+        self.virtio_mmio_bases = Array[UInt64, VIRTIO_MMIO_MAX](uninitialized=True)
 
 
 struct MemRegions:
@@ -105,6 +110,13 @@ def read_cells(addr: Int, ncells: Int) -> UInt64:
     return v
 
 
+def add_virtio_mmio(mut bp: BootParams, base: UInt64):
+    if bp.virtio_mmio_count < VIRTIO_MMIO_MAX:
+        bp.virtio_mmio_bases[bp.virtio_mmio_count] = base
+        bp.virtio_mmio_count += 1
+
+
+
 def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
     """Parse the flattened device tree at `dtb`.
 
@@ -126,6 +138,9 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
     var pos = dtb + struct_off
     var in_chosen = False
     var in_mem = False
+    var in_virtio_mmio = False
+    var virtio_is_compatible = False
+    var virtio_base: UInt64 = 0
     var depth: Int = 0
     var acroot: Int = 2  # default for aarch64 if root omits #address-cells
     var scroot: Int = 2  # default for aarch64 if root omits #size-cells
@@ -138,14 +153,21 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
             while read_u8(name + n) != 0:
                 n += 1
             if depth == 1:
-                # direct child of the root node
+                # Direct child of the root node.
                 in_chosen = cstr_eq(name, "chosen")
                 in_mem = name_has_prefix(name, "memory")
+                in_virtio_mmio = name_has_prefix(name, "virtio_mmio")
+                virtio_is_compatible = False
+                virtio_base = 0
             depth += 1
             pos += 4 + align4(n + 1)
         elif tok == FDT_END_NODE:
-            in_chosen = False
-            in_mem = False
+            if depth == 2 and in_virtio_mmio and virtio_is_compatible:
+                add_virtio_mmio(bp, virtio_base)
+            if depth == 2:
+                in_chosen = False
+                in_mem = False
+                in_virtio_mmio = False
             depth -= 1
             pos += 4
         elif tok == FDT_PROP:
@@ -154,7 +176,7 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
             var data = pos + 12
             var pname = dtb + strings_off + nameoff
             if depth == 1:
-                # root-level properties set the addressing used by /memory
+                # Root-level properties set the addressing used by /memory.
                 if cstr_eq(pname, "#address-cells") and plen >= 4:
                     acroot = Int(read_u32be(data))
                 elif cstr_eq(pname, "#size-cells") and plen >= 4:
@@ -186,6 +208,11 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
                     off += scroot * 4
                     left -= (acroot + scroot) * 4
                     mem.add(b, s)
+            elif in_virtio_mmio:
+                if cstr_eq(pname, "compatible") and cstr_eq(data, "virtio,mmio"):
+                    virtio_is_compatible = True
+                elif cstr_eq(pname, "reg") and plen >= (acroot + scroot) * 4:
+                    virtio_base = read_cells(data, acroot)
             pos = data + align4(plen)
         elif tok == FDT_END:
             break

@@ -6,6 +6,29 @@
 .equ UART_FR,   0x018
 .equ UART_TXFF, 0x20
 
+
+.global virtio_mb
+virtio_mb:
+    dmb     osh
+    ret
+
+.global virtio_wait
+virtio_wait:
+    yield
+    ret
+
+.global virtio_sync
+virtio_sync:
+    // Clean and invalidate every 64-byte cache line intersecting [x0,x0+x1).
+    add     x1, x0, x1
+    and     x0, x0, #-64
+.Lvirtio_sync_line:
+    dc      civac, x0
+    add     x0, x0, #64
+    cmp     x0, x1
+    b.lo    .Lvirtio_sync_line
+    dsb     osh
+    ret
 _start:
     // QEMU's `virt` machine passes boot parameters to the kernel entry in
     // x0-x3 (Linux boot protocol style): x0 = physical address of the DTB

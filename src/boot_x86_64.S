@@ -2,6 +2,69 @@
 .global _start
 .extern kmain
 
+.global virtio_mb
+virtio_mb:
+    mfence
+    retq
+
+.global virtio_wait
+virtio_wait:
+    pause
+    retq
+
+.global virtio_sync
+virtio_sync:
+    addq    %rdi, %rsi
+    andq    $-64, %rdi
+.Lvirtio_sync_line:
+    clflush (%rdi)
+    addq    $64, %rdi
+    cmpq    %rsi, %rdi
+    jb      .Lvirtio_sync_line
+    mfence
+    retq
+
+.global x86_in8
+x86_in8:
+    movw    %di, %dx
+    xorl    %eax, %eax
+    inb     %dx, %al
+    retq
+
+.global x86_in16
+x86_in16:
+    movw    %di, %dx
+    xorl    %eax, %eax
+    inw     %dx, %ax
+    retq
+
+.global x86_in32
+x86_in32:
+    movw    %di, %dx
+    inl     %dx, %eax
+    retq
+
+.global x86_out8
+x86_out8:
+    movw    %di, %dx
+    movl    %esi, %eax
+    outb    %al, %dx
+    retq
+
+.global x86_out16
+x86_out16:
+    movw    %di, %dx
+    movl    %esi, %eax
+    outw    %ax, %dx
+    retq
+
+.global x86_out32
+x86_out32:
+    movw    %di, %dx
+    movl    %esi, %eax
+    outl    %eax, %dx
+    retq
+
 _start:
     # Entry point for the x86_64 ELF kernel.
     # When launched by the UEFI bootloader:

@@ -51,6 +51,17 @@ USER_TARGET  := aarch64-none-elf
 BUILD_DIR    := build
 KERNEL_ELF   := $(BUILD_DIR)/kernel.elf
 KERNEL_BIN   := $(BUILD_DIR)/kernel.bin
+# A raw scratch disk exposed as a VirtIO 1.0 MMIO block device on AArch64
+# QEMU's `virt` machine. It intentionally has no filesystem; the kernel
+# probes it and synchronously reads sector zero as a transport smoke test.
+VIRTIO_BLK_IMAGE ?= $(BUILD_DIR)/virtio-blk.img
+VIRTIO_BLK_SIZE  ?= 16M
+VIRTIO_BLK_QEMU  := -global virtio-mmio.force-legacy=false \
+	-drive if=none,format=raw,file=$(VIRTIO_BLK_IMAGE),id=virtio-blk0 \
+	-device virtio-blk-device,drive=virtio-blk0
+VIRTIO_BLK_X86_QEMU := -drive if=none,format=raw,file=$(VIRTIO_BLK_IMAGE),id=virtio-blk0 \
+	-device virtio-blk-pci-transitional,drive=virtio-blk0
+
 OBJS         := $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o
 LINKER_SCRIPT:= src/linker.ld
 
@@ -103,7 +114,7 @@ X86_INITRD     := $(BUILD_DIR)/initrd_x86_64.cpio
 
 INITRD_ENTRIES := init=$(INIT_MACHO) usr/lib/libSystem.B.dylib=$(INIT_DYLIB) usr/lib/libSystem.dylib=$(INIT_DYLIB)
 
-.PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi uefi-aa64 run-uefi-aa64
+.PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi uefi-aa64 run-uefi-aa64 virtio-blk-image
 
 all: $(KERNEL_ELF)
 
@@ -170,11 +181,10 @@ $(UEFI_AA64_INITRD): $(INITRD)
 	mkdir -p $(dir $@)
 	cp $< $@
 
-# OVMF_CODE can be overridden for distributions that store OVMF elsewhere.
-run-uefi: uefi
+run-uefi: uefi virtio-blk-image
 	@test -n "$(OVMF_CODE)" || { echo "Set OVMF_CODE to a monolithic OVMF firmware image"; exit 1; }
 	$(QEMU_X86) -machine q35 -m 128M -nographic -bios $(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:$(UEFI_ESP)
+		-drive format=raw,file=fat:rw:$(UEFI_ESP) $(VIRTIO_BLK_X86_QEMU)
 
 run-uefi-aa64: uefi-aa64
 	@test -f "$(QEMU_AA64_EFI)" || { echo "Set QEMU_AA64_EFI to an AArch64 UEFI firmware image"; exit 1; }
@@ -184,6 +194,11 @@ run-uefi-aa64: uefi-aa64
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+virtio-blk-image: $(VIRTIO_BLK_IMAGE)
+
+$(VIRTIO_BLK_IMAGE): | $(BUILD_DIR)
+	truncate -s $(VIRTIO_BLK_SIZE) $@
 
 $(BUILD_DIR)/boot.o: src/boot.S | $(BUILD_DIR)
 	$(CLANG) $(ASFLAGS) $< -o $@
@@ -239,14 +254,15 @@ userspace: $(INITRD)
 # Run the kernel the way Linux boots: raw image + DTB + cpio initrd, so the
 # kernel loads /init from the initrd and runs it at EL0. (Override INITRD or
 # APPEND on the command line if you want a different initramfs.)
-run-linux: $(KERNEL_BIN) $(INITRD)
-	@echo "--- Starting QEMU (Linux-protocol boot, initrd present, -cpu $(QEMU_CPU)) ---"
+run-linux: $(KERNEL_BIN) $(INITRD) virtio-blk-image
+	@echo "--- Starting QEMU (Linux-protocol boot, initrd + VirtIO blk, -cpu $(QEMU_CPU)) ---"
 	$(QEMU) -M virt -cpu $(QEMU_CPU) -nographic -kernel $(KERNEL_BIN) \
-		-initrd $(INITRD) -append "$(APPEND)"
+		-initrd $(INITRD) -append "$(APPEND)" $(VIRTIO_BLK_QEMU)
 
-run: $(KERNEL_ELF)
-	@echo "--- Starting QEMU (Press Ctrl+A then X to exit) ---"
-	$(QEMU) -M virt -cpu $(QEMU_CPU) -nographic -kernel $(KERNEL_ELF)
+run: $(KERNEL_ELF) virtio-blk-image
+	@echo "--- Starting QEMU (VirtIO blk enabled; Press Ctrl+A then X to exit) ---"
+	$(QEMU) -M virt -cpu $(QEMU_CPU) -nographic -kernel $(KERNEL_ELF) $(VIRTIO_BLK_QEMU)
+
 
 clean:
 	rm -rf $(BUILD_DIR)

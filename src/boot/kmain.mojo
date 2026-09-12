@@ -10,6 +10,8 @@ from std.sys.info import CompilationTarget
 from arch.console import ARCH, print_int, print_str, print_uint, println, putc
 from arch.dtb import BootParams, MemRegions, parse_dtb
 from arch.xnu_parser import is_xnu_boot_args, parse_xnu_boot_args
+from arch.virtio_blk import VirtioBlk
+from arch.virtio_blk_pci import VirtioBlkPci
 from arch.mem import read_u16, read_u8
 from core.kstate import (
     OFF_FREE_HEAD,
@@ -155,6 +157,52 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
             print_str("[paging] init_user_vm failed\n")
     else:
         print_str("[alloc] no RAM region from /memory\n")
+
+    comptime if ARCH == "x86_64":
+        var blk = VirtioBlkPci()
+        if blk.init(alloc):
+            print_str("[virtio-blk] capacity=")
+            print_uint(blk.capacity_sectors, 10)
+            print_str(" sectors")
+            if blk.read_sector(0):
+                print_str(" sector0[0]=0x")
+                print_uint(UInt64(blk.first_byte()), 16)
+            else:
+                print_str(" sector0 read failed")
+            putc(0x0A)
+        else:
+            print_str("[virtio-blk] no PCI block device found\n")
+
+    comptime if ARCH != "x86_64":
+        # QEMU supplies the DTB for raw Linux-protocol images, but not when
+        # it loads our ELF directly. Its `virt` board exposes up to 32 MMIO
+        # transports at this documented aperture, so retain a bounded
+        # fallback scan for `make run`.
+        var candidates = bp.virtio_mmio_count
+        if candidates == 0:
+            candidates = 32
+        var blk = VirtioBlk()
+        var found = False
+        for i in range(candidates):
+            var base = (
+                bp.virtio_mmio_bases[i]
+                if bp.virtio_mmio_count != 0
+                else UInt64(0x0A000000 + i * 0x200)
+            )
+            if blk.init(alloc, base):
+                found = True
+                print_str("[virtio-blk] capacity=")
+                print_uint(blk.capacity_sectors, 10)
+                print_str(" sectors")
+                if blk.read_sector(0):
+                    print_str(" sector0[0]=0x")
+                    print_uint(UInt64(blk.first_byte()), 16)
+                else:
+                    print_str(" sector0 read failed")
+                putc(0x0A)
+                break
+        if not found:
+            print_str("[virtio-blk] no block device found\n")
 
     if bp.has_initrd:
         var fs = unpack_cpio(Int(bp.initrd_start), Int(bp.initrd_end))
