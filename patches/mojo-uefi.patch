@@ -1,0 +1,238 @@
+diff --git a/Mojo/lib/KGENToLLVM/CABILowering.cpp b/Mojo/lib/KGENToLLVM/CABILowering.cpp
+index 3be1f0d712..306ea1685a 100644
+--- a/Mojo/lib/KGENToLLVM/CABILowering.cpp
++++ b/Mojo/lib/KGENToLLVM/CABILowering.cpp
+@@ -14,6 +14,7 @@
+ #include "CABILowering.h"
+ #include "CABIAAPCS.h"
+ #include "CABISystemV.h"
++#include "CABIWin64.h"
+ #include "LLVMLoweringUtils.h"
+ #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+ #include "mlir/IR/BuiltinTypes.h"
+@@ -73,7 +74,11 @@ M::KGEN::createCABIInfo(const llvm::Triple &triple, mlir::MLIRContext *ctx,
+ 
+   switch (arch) {
+   case llvm::Triple::x86_64:
+-    // x86-64: Use System V AMD64 ABI (Linux, macOS, BSD)
++    // x86-64: Use Microsoft x64 (Win64) ABI for Windows and UEFI targets.
++    // Otherwise use System V AMD64 ABI (Linux, macOS, BSD).
++    if (triple.isOSWindows() || triple.isWindowsMSVCEnvironment() ||
++        triple.getOS() == llvm::Triple::UEFI)
++      return std::make_unique<Win64ABIInfo>(ctx, dataLayout);
+     return std::make_unique<SystemVABIInfo>(ctx, dataLayout);
+ 
+   case llvm::Triple::aarch64:
+diff --git a/Mojo/lib/KGENToLLVM/CABIWin64.cpp b/Mojo/lib/KGENToLLVM/CABIWin64.cpp
+new file mode 100644
+index 0000000000..62bc57e62d
+--- /dev/null
++++ b/Mojo/lib/KGENToLLVM/CABIWin64.cpp
+@@ -0,0 +1,83 @@
++//===----------------------------------------------------------------------===//
++// Copyright (c) 2026, Modular Inc. All rights reserved.
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions:
++// https://llvm.org/LICENSE.txt
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//===----------------------------------------------------------------------===//
++
++#include "CABIWin64.h"
++#include "LLVMLoweringUtils.h"
++
++using namespace M;
++using namespace M::KGEN;
++
++//===----------------------------------------------------------------------===//
++// Constructor
++//===----------------------------------------------------------------------===//
++
++Win64ABIInfo::Win64ABIInfo(mlir::MLIRContext *ctx,
++                           const LLVMDataLayout &dataLayout)
++    : CABIInfo(ctx, dataLayout) {}
++
++//===----------------------------------------------------------------------===//
++// Argument Classification
++//===----------------------------------------------------------------------===//
++
++CoercionInfo Win64ABIInfo::classifyArgumentType(mlir::Type type,
++                                                mlir::Location loc,
++                                                bool isVariadicArg) const {
++  if (isa<mlir::LLVM::LLVMArrayType>(type))
++    return CoercionInfo::indirectArgument(/*useByval=*/false);
++
++  auto structType = dyn_cast<mlir::LLVM::LLVMStructType>(type);
++  if (!structType)
++    return CoercionInfo{}; // Identity: non-structs pass directly.
++
++  int64_t size = CabiUtils::getStructSize(structType, dataLayout);
++
++  // Win64 ABI rule: Structs whose size is exactly 1, 2, 4, or 8 bytes are
++  // passed by value in an integer register (coerced to integer).
++  switch (size) {
++  case 1:
++  case 2:
++  case 4:
++  case 8:
++    return CabiUtils::classifySmallIntegerStruct(size, ctx);
++  default:
++    // Any other size (e.g. 3, 5, 6, 7, or >8 bytes) is passed by reference
++    // (caller allocates a temporary and passes a pointer to it, non-byval).
++    return CoercionInfo::indirectArgument(/*useByval=*/false);
++  }
++}
++
++//===----------------------------------------------------------------------===//
++// Return Value Classification
++//===----------------------------------------------------------------------===//
++
++CoercionInfo Win64ABIInfo::classifyReturnType(mlir::Type type,
++                                              mlir::Location loc) const {
++  auto structType = dyn_cast<mlir::LLVM::LLVMStructType>(type);
++  if (!structType)
++    return CoercionInfo{}; // Identity: non-structs return directly.
++
++  int64_t size = CabiUtils::getStructSize(structType, dataLayout);
++
++  // Win64 ABI rule: Structs whose size is exactly 1, 2, 4, or 8 bytes are
++  // returned in RAX (coerced to integer).
++  switch (size) {
++  case 1:
++  case 2:
++  case 4:
++  case 8:
++    return CabiUtils::classifySmallIntegerStruct(size, ctx);
++  default:
++    // Any other size is returned via a hidden sret pointer.
++    return CoercionInfo::sretReturn();
++  }
++}
+diff --git a/Mojo/lib/KGENToLLVM/CABIWin64.h b/Mojo/lib/KGENToLLVM/CABIWin64.h
+new file mode 100644
+index 0000000000..470e9d549e
+--- /dev/null
++++ b/Mojo/lib/KGENToLLVM/CABIWin64.h
+@@ -0,0 +1,46 @@
++//===----------------------------------------------------------------------===//
++// Copyright (c) 2026, Modular Inc. All rights reserved.
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions:
++// https://llvm.org/LICENSE.txt
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//===----------------------------------------------------------------------===//
++
++#ifndef KGEN_LIB_KGENTOLLVM_CABIWIN64_H
++#define KGEN_LIB_KGENTOLLVM_CABIWIN64_H
++
++#include "CABILowering.h"
++
++namespace M::KGEN {
++
++/// Implementation of Microsoft x64 (Win64) calling convention.
++///
++/// Used by Windows x86-64 and UEFI targets.
++///
++/// Key rules:
++/// - Structs of size 1, 2, 4, or 8 bytes: coerced to an integer of the same
++///   size (i8, i16, i32, i64) and passed/returned in registers (RCX/RDX/R8/R9,
++///   RAX for return).
++/// - Structs of any other size (including 3, 5, 6, 7, and >8 bytes):
++///   passed by reference (pointer allocated by caller, without byval)
++///   and returned via sret (hidden pointer parameter in RCX).
++class Win64ABIInfo : public CABIInfo {
++public:
++  Win64ABIInfo(mlir::MLIRContext *ctx, const LLVMDataLayout &dataLayout);
++
++protected:
++  CoercionInfo classifyArgumentType(mlir::Type type, mlir::Location loc,
++                                    bool isVariadicArg) const override;
++
++  CoercionInfo classifyReturnType(mlir::Type type,
++                                  mlir::Location loc) const override;
++};
++
++} // namespace M::KGEN
++
++#endif // KGEN_LIB_KGENTOLLVM_CABIWIN64_H
+diff --git a/Mojo/test/kgen/pop-to-llvm/extern-c-abi-win64.mlir b/Mojo/test/kgen/pop-to-llvm/extern-c-abi-win64.mlir
+new file mode 100644
+index 0000000000..1dd4dfadab
+--- /dev/null
++++ b/Mojo/test/kgen/pop-to-llvm/extern-c-abi-win64.mlir
+@@ -0,0 +1,66 @@
++// RUN: kgen-opt -split-input-file -lower-global-pop-to-llvm %s | FileCheck %s
++
++// Unit tests for C ABI lowering on x86-64 Win64 / UEFI.
++
++// Win64 1: 8-byte struct {i32, i32} coerces to i64 register.
++module attributes {M.target_info = #M.target<triple="x86_64-unknown-uefi", arch="", features="", data_layout="e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", simd_bit_width=128>} {
++// CHECK-LABEL: @test_arg_8byte
++llvm.func @test_arg_8byte(%arg0: !llvm.struct<(i32, i32)>) {
++  // CHECK: llvm.call @ext_i64(%{{.*}}) : (i64) -> ()
++  pop.external_call @ext_i64(%arg0) : (!llvm.struct<(i32, i32)>) -> ()
++  llvm.return
++}
++// CHECK: llvm.func @ext_i64(i64)
++}
++
++// -----
++
++// Win64 2: 3-byte struct is passed indirectly (by reference, non-byval).
++module attributes {M.target_info = #M.target<triple="x86_64-pc-windows-msvc", arch="", features="", data_layout="e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", simd_bit_width=128>} {
++// CHECK-LABEL: @test_arg_3byte
++llvm.func @test_arg_3byte(%arg0: !llvm.struct<(i8, i8, i8)>) {
++  // CHECK: llvm.call @ext_3byte(%{{.*}}) : (!llvm.ptr) -> ()
++  pop.external_call @ext_3byte(%arg0) : (!llvm.struct<(i8, i8, i8)>) -> ()
++  llvm.return
++}
++// CHECK: llvm.func @ext_3byte(!llvm.ptr)
++}
++
++// -----
++
++// Win64 3: Large struct (>8 bytes) is passed indirectly (by reference, non-byval).
++module attributes {M.target_info = #M.target<triple="x86_64-unknown-uefi", arch="", features="", data_layout="e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", simd_bit_width=128>} {
++// CHECK-LABEL: @test_arg_large
++llvm.func @test_arg_large(%arg0: !llvm.struct<(i64, i64)>) {
++  // CHECK: llvm.call @ext_large(%{{.*}}) : (!llvm.ptr) -> ()
++  pop.external_call @ext_large(%arg0) : (!llvm.struct<(i64, i64)>) -> ()
++  llvm.return
++}
++// CHECK: llvm.func @ext_large(!llvm.ptr)
++}
++
++// -----
++
++// Win64 4: Small struct return (8 bytes) coerced to i64 integer.
++module attributes {M.target_info = #M.target<triple="x86_64-unknown-uefi", arch="", features="", data_layout="e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", simd_bit_width=128>} {
++// CHECK-LABEL: @test_ret_small
++llvm.func @test_ret_small() {
++  // CHECK: llvm.call @ext_ret_small() : () -> i64
++  %0 = pop.external_call @ext_ret_small() : () -> !llvm.struct<(i32, i32)>
++  llvm.return
++}
++// CHECK: llvm.func @ext_ret_small() -> i64
++}
++
++// -----
++
++// Win64 5: Struct return of size != 1, 2, 4, 8 bytes uses sret hidden pointer.
++module attributes {M.target_info = #M.target<triple="x86_64-unknown-uefi", arch="", features="", data_layout="e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", simd_bit_width=128>} {
++// CHECK-LABEL: @test_ret_sret
++llvm.func @test_ret_sret() {
++  // CHECK: llvm.call @ext_ret_large(%{{.*}}) : (!llvm.ptr) -> ()
++  %0 = pop.external_call @ext_ret_large() : () -> !llvm.struct<(i64, i64)>
++  llvm.return
++}
++// CHECK: llvm.func @ext_ret_large(!llvm.ptr {llvm.sret = !llvm.struct<(i64, i64)>})
++}

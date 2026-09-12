@@ -1,5 +1,6 @@
 CLANG        ?= clang
 LLD          ?= ld.lld
+LLD_LINK     ?= lld-link
 # Custom-built mojo (work/modular) that auto-selects the "baremetal" stdlib
 # plugin for `-none-` target triples, so `debug_assert`/`abort` work without
 # libc. The stock nix-packaged mojo does not have this patch.
@@ -61,6 +62,25 @@ KERNEL_BIN   := $(BUILD_DIR)/kernel.bin
 OBJS         := $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o
 LINKER_SCRIPT:= src/linker.ld
 
+# ------------------------------------------------------------------------
+# x86_64 UEFI hello application
+# ------------------------------------------------------------------------
+# Kept separate from the AArch64 kernel targets: UEFI starts us in long mode
+# and requires a PE/COFF EFI application, not the kernel's ELF image.
+UEFI_TARGET      := x86_64-unknown-uefi
+UEFI_CPU         := x86-64
+UEFI_DIR         := $(BUILD_DIR)/uefi
+UEFI_APP         := $(UEFI_DIR)/BOOTX64.EFI
+UEFI_ESP         := $(UEFI_DIR)/esp
+UEFI_BOOT_APP    := $(UEFI_ESP)/EFI/BOOT/BOOTX64.EFI
+NATIVE_APP        := $(UEFI_DIR)/MOJOOS.EFI
+NATIVE_ESP_APP    := $(UEFI_ESP)/MOJOOS.EFI
+UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+QEMU_X86         ?= qemu-system-x86_64
+# `-bios` needs a monolithic firmware image. Override this for distributions
+# that package an equivalent image at a different path.
+OVMF_CODE        ?= $(firstword $(wildcard /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF.fd))
+
 INIT_ELF     := $(BUILD_DIR)/init
 INITRD       := $(BUILD_DIR)/initrd.cpio
 MKCPIO       := $(BUILD_DIR)/mkcpio
@@ -68,9 +88,48 @@ MKCPIO       := $(BUILD_DIR)/mkcpio
 # User-space binaries to bundle into the initrd, as archive-name=path pairs.
 INITRD_ENTRIES := init=$(INIT_ELF)
 
-.PHONY: all clean run run-linux userspace
+.PHONY: all clean run run-linux userspace uefi native-kernel run-uefi
 
 all: $(KERNEL_ELF)
+
+uefi: $(UEFI_APP) $(NATIVE_APP)
+
+native-kernel: $(NATIVE_APP)
+
+$(UEFI_DIR):
+	mkdir -p $@
+
+$(UEFI_DIR)/main.o: uefi/main.mojo | $(UEFI_DIR)
+	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
+
+$(UEFI_DIR)/loader.o: uefi/loader.mojo | $(UEFI_DIR)
+	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
+
+$(UEFI_DIR)/native_kernel.o: uefi/native_kernel.mojo | $(UEFI_DIR)
+	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
+
+$(UEFI_DIR)/native_start.o: uefi/native_start.S | $(UEFI_DIR)
+	$(CLANG) --target=$(UEFI_TARGET) -c $< -o $@
+
+$(NATIVE_APP): $(UEFI_DIR)/native_kernel.o $(UEFI_DIR)/native_start.o
+	$(LLD_LINK) /subsystem:native /entry:native_entry /nodefaultlib /machine:x64 /fixed /out:$@ $^
+
+$(UEFI_APP): $(UEFI_DIR)/main.o $(UEFI_DIR)/loader.o
+	$(LLD_LINK) /subsystem:efi_application /entry:efi_main /nodefaultlib /machine:x64 /out:$@ $^
+
+$(UEFI_BOOT_APP): $(UEFI_APP) $(NATIVE_ESP_APP)
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(NATIVE_ESP_APP): $(NATIVE_APP)
+	mkdir -p $(dir $@)
+	cp $< $@
+
+# OVMF_CODE can be overridden for distributions that store OVMF elsewhere.
+run-uefi: $(UEFI_BOOT_APP)
+	@test -n "$(OVMF_CODE)" || { echo "Set OVMF_CODE to a monolithic OVMF firmware image"; exit 1; }
+	$(QEMU_X86) -machine q35 -m 128M -nographic -bios $(OVMF_CODE) \
+		-drive format=raw,file=fat:rw:$(UEFI_ESP)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -101,7 +160,7 @@ $(MKCPIO): tools/mkcpio.mojo src/fs/cpio.mojo | $(BUILD_DIR)
 
 # /init for the ramfs: a tiny freestanding ELF that does raw Linux syscalls.
 $(INIT_ELF): src/user/init.c src/user/user.ld | $(BUILD_DIR)
-	$(USER_CC) --target=$(USER_TARGET) -ffreestanding -fno-builtin \
+	$(USER_CC) --target=$(USER_TARGET) -ffreestanding -fno-builtin -fuse-ld=lld \
 		-nostdlib -static -fno-pie -O2 -Wall \
 		-Wl,-T,src/user/user.ld -o $@ $<
 

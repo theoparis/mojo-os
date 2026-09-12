@@ -32,6 +32,31 @@ make PAGE_SHIFT=14 run-linux
 make run
 ```
 
+## x86_64 UEFI hello world
+
+The repository also contains a deliberately small, standalone UEFI
+application. It is separate from the AArch64 kernel build and compiles Mojo
+to a COFF object for `x86_64-unknown-uefi`, then links a PE32+ EFI application:
+
+```sh
+# Produces build/uefi/BOOTX64.EFI.
+make uefi
+
+# Stages it as EFI/BOOT/BOOTX64.EFI on a directory-backed FAT ESP and boots
+# it with QEMU + OVMF. Override OVMF_CODE if your firmware lives elsewhere.
+make run-uefi
+```
+
+`run-uefi` defaults to the monolithic OVMF path used by Fedora-style edk2
+packages (`/usr/share/edk2/x64/OVMF.4m.fd`). It requires `qemu-system-x86_64`
+and an OVMF image. The application prints `Hello from Mojo UEFI!` through
+`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString` and returns `EFI_SUCCESS`.
+
+The UEFI firmware interface uses the Microsoft x64 ABI while Mojo's C ABI is
+System V on x86-64. [`uefi/start.S`](./uefi/start.S) contains the intentionally
+small adapter; [`uefi/main.mojo`](./uefi/main.mojo) remains the Mojo entry
+logic and invokes it via `std.ffi.external_call`.
+
 PAGE_SHIFT selects the translation granule (12 = 4KB default, 14 = 16KB)
 and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
 (phys.mojo/paging.mojo). See docs/16k-pages.md.
