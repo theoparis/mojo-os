@@ -48,7 +48,7 @@ PAGE_SHIFT   ?= 12
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -DPAGE_SHIFT=$(PAGE_SHIFT) -c
-MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 # Freestanding userspace binaries are compiled with clang for a bare
 # `-none-` triple (no OS, no libc) and linked as static non-PIE ET_EXEC by
@@ -63,19 +63,27 @@ OBJS         := $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o
 LINKER_SCRIPT:= src/linker.ld
 
 # ------------------------------------------------------------------------
-# x86_64 UEFI hello application
+# x86_64 UEFI bootloader application & kernel
 # ------------------------------------------------------------------------
-# Kept separate from the AArch64 kernel targets: UEFI starts us in long mode
-# and requires a PE/COFF EFI application, not the kernel's ELF image.
+# UEFI starts us in long mode and requires a PE/COFF EFI application (BOOTX64.EFI)
+# which parses and loads the freestanding x86_64 ELF kernel image.
 UEFI_TARGET      := x86_64-unknown-uefi
 UEFI_CPU         := x86-64
 UEFI_DIR         := $(BUILD_DIR)/uefi
 UEFI_APP         := $(UEFI_DIR)/BOOTX64.EFI
 UEFI_ESP         := $(UEFI_DIR)/esp
 UEFI_BOOT_APP    := $(UEFI_ESP)/EFI/BOOT/BOOTX64.EFI
-NATIVE_APP        := $(UEFI_DIR)/MOJOOS.EFI
-NATIVE_ESP_APP    := $(UEFI_ESP)/MOJOOS.EFI
-UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+UEFI_KERNEL_ELF  := $(UEFI_ESP)/kernel.elf
+UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) -I . --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+
+X86_TARGET       := x86_64-unknown-none-elf
+X86_CPU          := x86-64
+X86_KERNEL_ELF   := $(BUILD_DIR)/kernel_x86_64.elf
+X86_OBJS         := $(BUILD_DIR)/boot_x86_64.o $(BUILD_DIR)/kernel_x86_64.o
+X86_LINKER_SCRIPT:= src/linker_x86_64.ld
+X86_ASFLAGS      := --target=$(X86_TARGET) -c
+X86_MOJOFLAGS    := -D ARCH=x86_64 -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(X86_TARGET) --mcpu=$(X86_CPU)
+
 QEMU_X86         ?= qemu-system-x86_64
 # `-bios` needs a monolithic firmware image. Override this for distributions
 # that package an equivalent image at a different path.
@@ -88,13 +96,13 @@ MKCPIO       := $(BUILD_DIR)/mkcpio
 # User-space binaries to bundle into the initrd, as archive-name=path pairs.
 INITRD_ENTRIES := init=$(INIT_ELF)
 
-.PHONY: all clean run run-linux userspace uefi native-kernel run-uefi
+.PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi
 
 all: $(KERNEL_ELF)
 
-uefi: $(UEFI_APP) $(NATIVE_APP)
+kernel-x86: $(X86_KERNEL_ELF)
 
-native-kernel: $(NATIVE_APP)
+uefi: $(UEFI_BOOT_APP) $(UEFI_KERNEL_ELF)
 
 $(UEFI_DIR):
 	mkdir -p $@
@@ -102,31 +110,31 @@ $(UEFI_DIR):
 $(UEFI_DIR)/main.o: uefi/main.mojo | $(UEFI_DIR)
 	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
 
-$(UEFI_DIR)/loader.o: uefi/loader.mojo | $(UEFI_DIR)
+$(UEFI_DIR)/uefi_loader.o: uefi/uefi_loader.mojo | $(UEFI_DIR)
 	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
 
-$(UEFI_DIR)/native_kernel.o: uefi/native_kernel.mojo | $(UEFI_DIR)
-	$(MOJO) build $(UEFI_MOJOFLAGS) $< -o $@
-
-$(UEFI_DIR)/native_start.o: uefi/native_start.S | $(UEFI_DIR)
-	$(CLANG) --target=$(UEFI_TARGET) -c $< -o $@
-
-$(NATIVE_APP): $(UEFI_DIR)/native_kernel.o $(UEFI_DIR)/native_start.o
-	$(LLD_LINK) /subsystem:native /entry:native_entry /nodefaultlib /machine:x64 /fixed /out:$@ $^
-
-$(UEFI_APP): $(UEFI_DIR)/main.o $(UEFI_DIR)/loader.o
+$(UEFI_APP): $(UEFI_DIR)/main.o $(UEFI_DIR)/uefi_loader.o
 	$(LLD_LINK) /subsystem:efi_application /entry:efi_main /nodefaultlib /machine:x64 /out:$@ $^
 
-$(UEFI_BOOT_APP): $(UEFI_APP) $(NATIVE_ESP_APP)
+$(BUILD_DIR)/boot_x86_64.o: src/boot_x86_64.S | $(BUILD_DIR)
+	$(CLANG) $(X86_ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/kernel_x86_64.o: src/kernel.mojo $(KERNEL_SRCS) | $(BUILD_DIR)
+	$(MOJO) build $(X86_MOJOFLAGS) $< -o $@
+
+$(X86_KERNEL_ELF): $(X86_LINKER_SCRIPT) $(X86_OBJS)
+	$(LLD) -T $(X86_LINKER_SCRIPT) $(X86_OBJS) -o $@
+
+$(UEFI_BOOT_APP): $(UEFI_APP)
 	mkdir -p $(dir $@)
 	cp $< $@
 
-$(NATIVE_ESP_APP): $(NATIVE_APP)
+$(UEFI_KERNEL_ELF): $(X86_KERNEL_ELF)
 	mkdir -p $(dir $@)
 	cp $< $@
 
 # OVMF_CODE can be overridden for distributions that store OVMF elsewhere.
-run-uefi: $(UEFI_BOOT_APP)
+run-uefi: $(UEFI_BOOT_APP) $(UEFI_KERNEL_ELF)
 	@test -n "$(OVMF_CODE)" || { echo "Set OVMF_CODE to a monolithic OVMF firmware image"; exit 1; }
 	$(QEMU_X86) -machine q35 -m 128M -nographic -bios $(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:$(UEFI_ESP)

@@ -1,14 +1,20 @@
-# PL011 UART driver and libc-free console formatting.
+# PL011 UART / COM1 serial driver and libc-free console formatting.
 #
-# QEMU's `virt` machine exposes the PrimeCell PL011 serial port at
-# 0x09000000. We poll the TX FIFO rather than interrupt-drive it. All
-# printing goes straight to the UART via `putc`; none of it allocates or
-# pulls in libc.
+# Supports AArch64 (PL011 MMIO at 0x09000000) and x86_64 (COM1 serial port
+# via x86_putc/x86_getc). All printing goes straight to the console via `putc`;
+# none of it allocates or pulls in libc.
 from std.collections.array import Array
 from std.collections.string.string_span import StringSpan
+from std.ffi import external_call
 from std.format import Writer
+from std.sys.defines import get_defined_string
+from std.sys.info import CompilationTarget
 
 from arch.mem import mmio_read_u32, mmio_write_u32, read_u8
+
+comptime ARCH = get_defined_string[
+    "ARCH", StringLiteral[CompilationTarget[].__triple_arch()]()
+]()
 
 comptime FR_TXFF: UInt32 = 0x20
 comptime FR_RXFE: UInt32 = 0x10
@@ -18,18 +24,24 @@ comptime HEX_DIGITS = "0123456789abcdef"
 
 @always_inline
 def putc(c: UInt8):
-    """Transmit a byte, blocking until the TX FIFO has room."""
-    while (mmio_read_u32[0x09000018]() & FR_TXFF) != 0:
-        _ = 0
-    mmio_write_u32[0x09000000](UInt32(c))
+    """Transmit a byte, blocking until the TX FIFO / serial port is ready."""
+    comptime if ARCH == "x86_64":
+        external_call["x86_putc", NoneType](Int(c))
+    else:
+        while (mmio_read_u32[0x09000018]() & FR_TXFF) != 0:
+            _ = 0
+        mmio_write_u32[0x09000000](UInt32(c))
 
 
 @always_inline
 def getc() -> UInt8:
-    """Receive a byte, blocking until the RX FIFO is non-empty."""
-    while (mmio_read_u32[0x09000018]() & FR_RXFE) != 0:
-        _ = 0
-    return UInt8(mmio_read_u32[0x09000000]() & 0xFF)
+    """Receive a byte, blocking until a byte is available."""
+    comptime if ARCH == "x86_64":
+        return UInt8(external_call["x86_getc", Int]())
+    else:
+        while (mmio_read_u32[0x09000018]() & FR_RXFE) != 0:
+            _ = 0
+        return UInt8(mmio_read_u32[0x09000000]() & 0xFF)
 
 
 def print_str(s: StringLiteral):

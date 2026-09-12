@@ -112,7 +112,7 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
     the caller-provided `mem`) in a single walk of the structure block.
     """
     var bp = BootParams()
-    if read_u32be(dtb) != 0xD00DFEED:
+    if dtb == 0 or read_u32be(dtb) != 0xD00DFEED:
         return bp^
     bp.has_dtb = True
     bp.dtb_start = UInt64(dtb)

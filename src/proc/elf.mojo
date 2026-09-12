@@ -1,95 +1,41 @@
-# Minimal ELF64/AArch64 loader.
+# ELF64 user process loader.
 #
-# We only need to support what our own userspace toolchain produces: a
-# static, non-PIE ET_EXEC binary with a handful of PT_LOAD segments. No
-# relocations, no dynamic linking, no PIE base slide.
-#
-# Each PT_LOAD is mapped into the user VA space *first* (via
-# src/mm/paging.mojo:map_user at 4KB granularity, permissions from p_flags;
-# map_user allocates real physical frames, so p_vaddr is a genuine virtual
-# address, not a physical one), then its bytes are copied to p_vaddr and
-# the p_memsz-p_filesz tail is zeroed (bss). p_vaddr is taken literally, so
-# a static non-PIE image links at its natural low VA (e.g. busybox/musl at
-# 0x400000); the kernel copy reads from the file bytes in RAM (identity
-# PA) and writes to the just-mapped low VA (EL1 can access EL0 pages).
+# Uses the freestanding `loader` package for ELF format parsing, validation,
+# and program header traversal.
 from arch.console import print_str, print_uint
-from arch.mem import read_u16, read_u32, read_u64, read_u8, write_u8
+from arch.mem import read_u8, write_u8
+from loader import (
+    EM_AARCH64,
+    EM_X86_64,
+    ET_EXEC,
+    PF_X,
+    PT_LOAD,
+    elf_entry,
+    elf_image_end,
+    elf_is_valid as _loader_elf_is_valid,
+    elf_machine,
+    elf_phentsize,
+    elf_phnum,
+    elf_phoff,
+    elf_phdrs,
+    elf_read_u32,
+    elf_read_u64,
+)
 from mm.paging import map_user
 from mm.phys import PhysAlloc
 
-comptime ET_EXEC: UInt16 = 2
-comptime EM_AARCH64: UInt16 = 183
-comptime PT_LOAD: UInt32 = 1
-comptime PF_X: UInt32 = 1
-
 
 def elf_is_valid(base: Int) -> Bool:
-    if read_u8(base + 0) != 0x7F:
+    if not _loader_elf_is_valid(base):
         return False
-    if read_u8(base + 1) != 0x45:  # 'E'
-        return False
-    if read_u8(base + 2) != 0x4C:  # 'L'
-        return False
-    if read_u8(base + 3) != 0x46:  # 'F'
-        return False
-    if read_u8(base + 4) != 2:  # ELFCLASS64
-        return False
-    if read_u8(base + 5) != 1:  # ELFDATA2LSB
-        return False
-    if read_u16(base + 18) != EM_AARCH64:
+    var mach = elf_machine(base)
+    if mach != EM_AARCH64 and mach != EM_X86_64:
         return False
     return True
 
 
-def elf_phdrs(base: Int) -> Int:
-    """Virtual address of the program-header table in the loaded image, or
-    0 if the headers are not covered by any PT_LOAD segment (then we can't
-    hand out AT_PHDR). Linux links static binaries with LOAD #1 at file
-    offset 0, so this normally succeeds."""
-    if not elf_is_valid(base):
-        return 0
-    var phoff = Int(read_u64(base + 32))
-    var phentsize = Int(read_u16(base + 54))
-    var phnum = Int(read_u16(base + 56))
-    var i = 0
-    while i < phnum:
-        var ph = base + phoff + i * phentsize
-        if read_u32(ph + 0) == PT_LOAD:
-            var p_offset = Int(read_u64(ph + 8))
-            var p_vaddr = Int(read_u64(ph + 16))
-            var p_filesz = Int(read_u64(ph + 32))
-            if (
-                phoff >= p_offset
-                and phoff + phnum * phentsize <= p_offset + p_filesz
-            ):
-                return p_vaddr + (phoff - p_offset)
-        i += 1
-    return 0
-
-
-def elf_image_end(base: Int) -> Int:
-    """Highest byte past the last PT_LOAD (p_vaddr + p_memsz), 0 if none."""
-    if not elf_is_valid(base):
-        return 0
-    var phoff = Int(read_u64(base + 32))
-    var phentsize = Int(read_u16(base + 54))
-    var phnum = Int(read_u16(base + 56))
-    var end: Int = 0
-    var i = 0
-    while i < phnum:
-        var ph = base + phoff + i * phentsize
-        if read_u32(ph + 0) == PT_LOAD:
-            var p_vaddr = Int(read_u64(ph + 16))
-            var p_memsz = Int(read_u64(ph + 40))
-            var e = p_vaddr + p_memsz
-            if e > end:
-                end = e
-        i += 1
-    return end
-
-
 def load_elf(mut alloc: PhysAlloc, l1: Int, base: Int) -> Int:
-    """Map and load the ELF64/AArch64 image at `base` into the user VA space.
+    """Map and load the ELF64 image at `base` into the user VA space.
 
     `base` points at the file bytes in memory (e.g. a ramfs entry); `l1` is
     the kernel level-1 page-table address. Each PT_LOAD segment is mapped
@@ -97,31 +43,24 @@ def load_elf(mut alloc: PhysAlloc, l1: Int, base: Int) -> Int:
     zeroed. Returns the entry address (0 = fail).
     """
     if not elf_is_valid(base):
-        print_str("[elf] not a recognized ELF64/aarch64 image\n")
+        print_str("[elf] not a recognized ELF64 image\n")
         return 0
 
-    var e_type = read_u16(base + 16)
-    if e_type != ET_EXEC:
-        print_str(
-            "[elf] unsupported e_type (need ET_EXEC, no PIE support yet)\n"
-        )
-        return 0
-
-    var e_entry = read_u64(base + 24)
-    var phoff = Int(read_u64(base + 32))
-    var phentsize = Int(read_u16(base + 54))
-    var phnum = Int(read_u16(base + 56))
+    var phoff = Int(elf_phoff(base))
+    var phentsize = Int(elf_phentsize(base))
+    var phnum = Int(elf_phnum(base))
+    var e_entry = elf_entry(base)
 
     var i = 0
     while i < phnum:
         var ph = base + phoff + i * phentsize
-        var p_type = read_u32(ph + 0)
+        var p_type = elf_read_u32(ph + 0)
         if p_type == PT_LOAD:
-            var p_flags = read_u32(ph + 4)
-            var p_offset = Int(read_u64(ph + 8))
-            var p_vaddr = Int(read_u64(ph + 16))
-            var p_filesz = Int(read_u64(ph + 32))
-            var p_memsz = Int(read_u64(ph + 40))
+            var p_flags = elf_read_u32(ph + 4)
+            var p_offset = Int(elf_read_u64(ph + 8))
+            var p_vaddr = Int(elf_read_u64(ph + 16))
+            var p_filesz = Int(elf_read_u64(ph + 32))
+            var p_memsz = Int(elf_read_u64(ph + 40))
             var src = base + p_offset
 
             # Map the segment's pages before touching them, so EL0 can get

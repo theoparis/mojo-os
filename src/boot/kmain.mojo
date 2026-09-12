@@ -7,7 +7,7 @@
 from std.sys.defines import MOJO_VERSION
 from std.sys.info import CompilationTarget
 
-from arch.console import print_int, print_str, print_uint, println, putc
+from arch.console import ARCH, print_int, print_str, print_uint, println, putc
 from arch.dtb import BootParams, MemRegions, parse_dtb
 from arch.mem import read_u16, read_u8
 from core.kstate import (
@@ -92,6 +92,12 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
     var bp = parse_dtb(x0, mem)
     if not bp.has_dtb:
         print_str("[dtb] none passed in x0\n")
+        if mem.n() == 0:
+            # Fallback for systems without a DTB.
+            comptime if ARCH == "x86_64":
+                mem.add(0x100000, 127 * 1024 * 1024)
+            else:
+                mem.add(0x40000000, 128 * 1024 * 1024)
     else:
         print_str("[dtb] @0x")
         print_uint(UInt64(x0), 16)
@@ -229,6 +235,8 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
                 print_str("[elf] failed to load /init\n")
         else:
             print_str("[ramfs] /init not found\n")
+    else:
+        print_str("[boot] system initialized successfully\n")
 
     while True:
         _ = 0

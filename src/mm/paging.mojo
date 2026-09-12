@@ -24,9 +24,15 @@
 from std.ffi import external_call
 from std.memory.pointer import Pointer
 from std.origin import MutUntrackedOrigin
+from std.sys.defines import get_defined_string
+from std.sys.info import CompilationTarget
 
 from arch.mem import read_u64, write_u64
 from mm.phys import PAGE_MASK, PAGE_SHIFT, PAGE_SIZE, PhysAlloc
+
+comptime ARCH = get_defined_string[
+    "ARCH", StringLiteral[CompilationTarget[].__triple_arch()]()
+]()
 
 # index bits per table = granule_bits - 3 (9 for 4KB, 11 for 16KB)
 comptime INDEX_BITS: Int = PAGE_SHIFT - 3
@@ -83,6 +89,8 @@ def init_user_vm(mut alloc: PhysAlloc, l1: Int) -> Bool:
     16KB: boot.S already left the top table's user slots (0..3) unmapped and
     map_user() creates leaf tables directly in them -- nothing to set up.
     """
+    comptime if ARCH == "x86_64":
+        return True
     if PAGE_SHIFT == 14:
         return True
     var table = alloc.alloc_pages(1)

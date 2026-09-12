@@ -1,5 +1,6 @@
 {
     "mojo.lsp.includeDirs": [
-        "src"
+        "src",
+        "loader"
     ]
 }

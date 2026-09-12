@@ -1,5 +1,15 @@
-# Pure Mojo UEFI PE loader implementing standard UEFI structs with @fieldwise_init
+# Pure Mojo UEFI ELF loader implementing standard UEFI structs with @fieldwise_init
+# Uses the freestanding `loader` package to parse and load ELF64 kernels.
 from std.memory import Pointer
+
+from loader import (
+    EM_X86_64,
+    elf_entry,
+    elf_is_valid,
+    elf_load_bounds,
+    elf_load_image,
+    elf_machine,
+)
 
 comptime EFI_SUCCESS: UInt64 = 0
 comptime EFI_LOAD_ERROR: UInt64 = 0x8000000000000001
@@ -8,12 +18,6 @@ comptime EFI_UNSUPPORTED: UInt64 = 0x8000000000000003
 comptime EFI_BUFFER_TOO_SMALL: UInt64 = 0x8000000000000005
 
 comptime EFI_FILE_MODE_READ: UInt64 = 1
-
-comptime IMAGE_DOS_SIGNATURE: UInt16 = 0x5A4D
-comptime IMAGE_NT_SIGNATURE: UInt32 = 0x00004550
-comptime IMAGE_FILE_MACHINE_AMD64: UInt16 = 0x8664
-comptime PE32PLUS_MAGIC: UInt16 = 0x020B
-comptime IMAGE_SUBSYSTEM_NATIVE: UInt16 = 1
 
 comptime EFI_STATUS = UInt64
 comptime EFI_HANDLE = Int
@@ -58,7 +62,7 @@ struct EFI_FILE_PROTOCOL(RegisterPassable):
         UInt64,
         UInt64,
     ) thin abi("C") -> EFI_STATUS
-    var Close: EFI_HANDLE
+    var Close: def(Pointer[Self, MutAnyOrigin]) thin abi("C") -> EFI_STATUS
     var Delete: EFI_HANDLE
     var Read: def(
         Pointer[Self, MutAnyOrigin], Pointer[UInt64, MutAnyOrigin], EFI_HANDLE
@@ -87,7 +91,9 @@ struct EFI_BOOT_SERVICES(RegisterPassable):
     var Hdr: EFI_TABLE_HEADER
     var RaiseTPL: EFI_HANDLE
     var RestoreTPL: EFI_HANDLE
-    var AllocatePages: EFI_HANDLE
+    var AllocatePages: def(
+        UInt32, UInt32, UInt64, Pointer[UInt64, MutAnyOrigin]
+    ) thin abi("C") -> EFI_STATUS
     var FreePages: EFI_HANDLE
     var GetMemoryMap: EFI_HANDLE
     var AllocatePool: def(
@@ -147,87 +153,6 @@ struct EFI_FILE_INFO(RegisterPassable):
     var Attribute: UInt64
 
 
-# PE/COFF Headers
-@fieldwise_init
-struct ImageDosHeader(RegisterPassable):
-    var e_magic: UInt16  # 0
-    var e_cblp: UInt16  # 2
-    var e_cp: UInt16  # 4
-    var e_crlc: UInt16  # 6
-    var e_cparhdr: UInt16  # 8
-    var e_minalloc: UInt16  # 10
-    var e_maxalloc: UInt16  # 12
-    var e_ss: UInt16  # 14
-    var e_sp: UInt16  # 16
-    var e_csum: UInt16  # 18
-    var e_ip: UInt16  # 20
-    var e_cs: UInt16  # 22
-    var e_lfarlc: UInt16  # 24
-    var e_ovno: UInt16  # 26
-    var e_res_0: UInt32  # 28
-    var e_res_1: UInt32  # 32
-    var e_oemid: UInt16  # 36
-    var e_oeminfo: UInt16  # 38
-    var e_res2_0: UInt32  # 40
-    var e_res2_1: UInt32  # 44
-    var e_res2_2: UInt32  # 48
-    var e_res2_3: UInt32  # 52
-    var e_res2_4: UInt32  # 56
-    var e_lfanew: UInt32  # 60
-
-
-@fieldwise_init
-struct ImageFileHeader(RegisterPassable):
-    var Machine: UInt16
-    var NumberOfSections: UInt16
-    var TimeDateStamp: UInt32
-    var PointerToSymbolTable: UInt32
-    var NumberOfSymbols: UInt32
-    var SizeOfOptionalHeader: UInt16
-    var Characteristics: UInt16
-
-
-@fieldwise_init
-struct ImageOptionalHeader64(RegisterPassable):
-    var Magic: UInt16
-    var MajorLinkerVersion: UInt8
-    var MinorLinkerVersion: UInt8
-    var SizeOfCode: UInt32
-    var SizeOfInitializedData: UInt32
-    var SizeOfUninitializedData: UInt32
-    var AddressOfEntryPoint: UInt32
-    var BaseOfCode: UInt32
-    var ImageBase: UInt64
-    var SectionAlignment: UInt32
-    var FileAlignment: UInt32
-    var MajorOperatingSystemVersion: UInt16
-    var MinorOperatingSystemVersion: UInt16
-    var MajorImageVersion: UInt16
-    var MinorImageVersion: UInt16
-    var MajorSubsystemVersion: UInt16
-    var MinorSubsystemVersion: UInt16
-    var Win32VersionValue: UInt32
-    var SizeOfImage: UInt32
-    var SizeOfHeaders: UInt32
-    var CheckSum: UInt32
-    var Subsystem: UInt16
-    var DllCharacteristics: UInt16
-
-
-@fieldwise_init
-struct ImageSectionHeader(RegisterPassable):
-    var Name: UInt64
-    var VirtualSize: UInt32
-    var VirtualAddress: UInt32
-    var SizeOfRawData: UInt32
-    var PointerToRawData: UInt32
-    var PointerToRelocations: UInt32
-    var PointerToLinenumbers: UInt32
-    var NumberOfRelocations: UInt16
-    var NumberOfLinenumbers: UInt16
-    var Characteristics: UInt32
-
-
 # Standard UEFI protocol GUIDs
 comptime LOADED_IMAGE_PROTOCOL_GUID = EFI_GUID(
     0x5B1B31A1, 0x9562, 0x11D2, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B
@@ -280,29 +205,53 @@ def uefi_load_and_boot(
     var root = Pointer[EFI_FILE_PROTOCOL, MutAnyOrigin](
         unsafe_from_address=root_handle
     )
-    var path: Array[UInt16, 12] = [
+
+    # Primary path: \kernel.elf
+    var path_kernel: Array[UInt16, 12] = [
         UInt16(ord("\\")),
-        UInt16(ord("M")),
-        UInt16(ord("O")),
-        UInt16(ord("J")),
-        UInt16(ord("O")),
-        UInt16(ord("O")),
-        UInt16(ord("S")),
+        UInt16(ord("k")),
+        UInt16(ord("e")),
+        UInt16(ord("r")),
+        UInt16(ord("n")),
+        UInt16(ord("e")),
+        UInt16(ord("l")),
         UInt16(ord(".")),
-        UInt16(ord("E")),
-        UInt16(ord("F")),
-        UInt16(ord("I")),
+        UInt16(ord("e")),
+        UInt16(ord("l")),
+        UInt16(ord("f")),
         UInt16(0),
     ]
     var path_ptr = Pointer[UInt16, MutAnyOrigin](
-        unsafe_from_address=Int(Pointer(to=path))
+        unsafe_from_address=Int(Pointer(to=path_kernel))
     )
     var file_handle: EFI_HANDLE = 0
     status = root[].Open(
         root, any_ptr(file_handle), path_ptr, EFI_FILE_MODE_READ, 0
     )
     if status != EFI_SUCCESS:
-        return 0x400 | status
+        # Fallback path: \MOJOOS.ELF
+        var path_fallback: Array[UInt16, 12] = [
+            UInt16(ord("\\")),
+            UInt16(ord("M")),
+            UInt16(ord("O")),
+            UInt16(ord("J")),
+            UInt16(ord("O")),
+            UInt16(ord("O")),
+            UInt16(ord("S")),
+            UInt16(ord(".")),
+            UInt16(ord("E")),
+            UInt16(ord("L")),
+            UInt16(ord("F")),
+            UInt16(0),
+        ]
+        var fb_ptr = Pointer[UInt16, MutAnyOrigin](
+            unsafe_from_address=Int(Pointer(to=path_fallback))
+        )
+        status = root[].Open(
+            root, any_ptr(file_handle), fb_ptr, EFI_FILE_MODE_READ, 0
+        )
+        if status != EFI_SUCCESS:
+            return 0x400 | status
 
     var file = Pointer[EFI_FILE_PROTOCOL, MutAnyOrigin](
         unsafe_from_address=file_handle
@@ -327,6 +276,7 @@ def uefi_load_and_boot(
         unsafe_from_address=meta_handle
     )
     var file_size = file_info[].FileSize
+    _ = bs[].FreePool(meta_handle)
 
     var raw_buf: EFI_HANDLE = 0
     status = bs[].AllocatePool(2, file_size, any_ptr(raw_buf))
@@ -335,81 +285,41 @@ def uefi_load_and_boot(
 
     var read_bytes = file_size
     status = file[].Read(file, any_ptr(read_bytes), raw_buf)
+    _ = file[].Close(file)
     if status != EFI_SUCCESS or read_bytes != file_size:
         return status if status != EFI_SUCCESS else EFI_LOAD_ERROR
 
-    # Parse PE headers
-    var dos_hdr = Pointer[ImageDosHeader, MutAnyOrigin](
-        unsafe_from_address=raw_buf
-    )
-    if dos_hdr[].e_magic != IMAGE_DOS_SIGNATURE:
+    # Validate ELF header via freestanding loader package
+    if not elf_is_valid(raw_buf):
+        return EFI_LOAD_ERROR
+    if elf_machine(raw_buf) != EM_X86_64:
         return EFI_LOAD_ERROR
 
-    var raw_addr = raw_buf
-    var nt_headers_addr = raw_addr + Int(dos_hdr[].e_lfanew)
-    var pe_sig = Pointer[UInt32, MutAnyOrigin](
-        unsafe_from_address=nt_headers_addr
-    ).unsafe_load()
-    if pe_sig != IMAGE_NT_SIGNATURE:
+    # Determine required memory bounds for PT_LOAD segments
+    var min_vaddr: UInt64 = 0
+    var max_vaddr: UInt64 = 0
+    if not elf_load_bounds(raw_buf, min_vaddr, max_vaddr):
         return EFI_LOAD_ERROR
 
-    var file_hdr = Pointer[ImageFileHeader, MutAnyOrigin](
-        unsafe_from_address=nt_headers_addr + 4
-    )
-    if file_hdr[].Machine != IMAGE_FILE_MACHINE_AMD64:
-        return EFI_LOAD_ERROR
-
-    var opt_hdr = Pointer[ImageOptionalHeader64, MutAnyOrigin](
-        unsafe_from_address=nt_headers_addr + 24
-    )
-    if opt_hdr[].Magic != PE32PLUS_MAGIC:
-        return EFI_LOAD_ERROR
-    if opt_hdr[].Subsystem != IMAGE_SUBSYSTEM_NATIVE:
-        return EFI_LOAD_ERROR
-
-    var image_size = UInt64(opt_hdr[].SizeOfImage)
-    var entry_rva = UInt64(opt_hdr[].AddressOfEntryPoint)
-    var headers_size = UInt64(opt_hdr[].SizeOfHeaders)
-
-    var image_base_handle: EFI_HANDLE = 0
-    status = bs[].AllocatePool(2, image_size, any_ptr(image_base_handle))
+    var page_count = (max_vaddr - min_vaddr + 4095) // 4096
+    var alloc_addr: UInt64 = min_vaddr
+    # Try AllocateAddress first (Type 2 = AllocateAddress, MemoryType 2 = EfiLoaderData)
+    status = bs[].AllocatePages(2, 2, page_count, any_ptr(alloc_addr))
     if status != EFI_SUCCESS:
-        return status
+        # Fallback to AllocateAnyPages (Type 0)
+        status = bs[].AllocatePages(0, 2, page_count, any_ptr(alloc_addr))
+        if status != EFI_SUCCESS:
+            return status
 
-    var base_ptr = Pointer[UInt8, MutAnyOrigin](
-        unsafe_from_address=image_base_handle
-    )
-    # Zero image buffer
-    for i in range(Int(image_size)):
-        base_ptr[unsafe_offset=i] = 0
+    var load_bias = Int(alloc_addr - min_vaddr)
+    if not elf_load_image(raw_buf, load_bias):
+        return EFI_LOAD_ERROR
 
-    # Copy headers
-    var raw_ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=raw_buf)
-    for i in range(Int(headers_size)):
-        base_ptr[unsafe_offset=i] = raw_ptr[unsafe_offset=i]
+    var entry_addr = Int(elf_entry(raw_buf)) + load_bias
 
-    # Map sections
-    var section_hdr_addr = (
-        nt_headers_addr + 24 + Int(file_hdr[].SizeOfOptionalHeader)
-    )
-    var section_ptr = Pointer[ImageSectionHeader, MutAnyOrigin](
-        unsafe_from_address=section_hdr_addr
-    )
-    var num_sections = Int(file_hdr[].NumberOfSections)
+    _ = bs[].FreePool(raw_buf)
 
-    for s in range(num_sections):
-        var sec = section_ptr.unsafe_offset(s)
-        var raw_sec_size = Int(sec[].SizeOfRawData)
-        if raw_sec_size > 0:
-            var src_offset = Int(sec[].PointerToRawData)
-            var dst_offset = Int(sec[].VirtualAddress)
-            for b in range(raw_sec_size):
-                base_ptr[unsafe_offset=dst_offset + b] = raw_ptr[
-                    unsafe_offset=src_offset + b
-                ]
-
-    # Entry point
-    var entry_addr = image_base_handle + Int(entry_rva)
+    # Transfer control to kernel entry point
     var entry_fn = Pointer[Int](to=entry_addr).unsafe_bitcast[
         def(Pointer[EFI_SYSTEM_TABLE, MutAnyOrigin]) thin abi("C") -> NoneType
     ]()[]

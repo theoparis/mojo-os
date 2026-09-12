@@ -32,30 +32,25 @@ make PAGE_SHIFT=14 run-linux
 make run
 ```
 
-## x86_64 UEFI hello world
+## x86_64 UEFI Bootloader & Kernel
 
-The repository also contains a deliberately small, standalone UEFI
-application. It is separate from the AArch64 kernel build and compiles Mojo
-to a COFF object for `x86_64-unknown-uefi`, then links a PE32+ EFI application:
+The repository supports booting the Mojo kernel on x86_64 via UEFI.
+A freestanding ELF loader package (`loader/`) is shared between the UEFI bootloader and the kernel:
+
+- `uefi/`: Builds a PE32+ EFI bootloader (`BOOTX64.EFI`) targeting `x86_64-unknown-uefi`. It locates `\kernel.elf` on the EFI System Partition (ESP), validates and loads its ELF64 segments using the shared `loader` package, and transfers control to the kernel.
+- `src/`: The Mojo OS kernel supports both AArch64 and x86_64 (`x86_64-unknown-none-elf`). On x86_64, `src/boot_x86_64.S` configures COM1 serial output, initializes the stack and BSS, and enters `kmain`.
 
 ```sh
-# Produces build/uefi/BOOTX64.EFI.
+# Builds the UEFI bootloader and x86_64 ELF kernel:
 make uefi
 
-# Stages it as EFI/BOOT/BOOTX64.EFI on a directory-backed FAT ESP and boots
-# it with QEMU + OVMF. Override OVMF_CODE if your firmware lives elsewhere.
+# Stages BOOTX64.EFI and kernel.elf onto the ESP and boots with QEMU + OVMF:
 make run-uefi
 ```
 
 `run-uefi` defaults to the monolithic OVMF path used by Fedora-style edk2
 packages (`/usr/share/edk2/x64/OVMF.4m.fd`). It requires `qemu-system-x86_64`
-and an OVMF image. The application prints `Hello from Mojo UEFI!` through
-`EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString` and returns `EFI_SUCCESS`.
-
-The UEFI firmware interface uses the Microsoft x64 ABI while Mojo's C ABI is
-System V on x86-64. [`uefi/start.S`](./uefi/start.S) contains the intentionally
-small adapter; [`uefi/main.mojo`](./uefi/main.mojo) remains the Mojo entry
-logic and invokes it via `std.ffi.external_call`.
+and an OVMF image.
 
 PAGE_SHIFT selects the translation granule (12 = 4KB default, 14 = 16KB)
 and is passed to both boot.S (TCR TG0 + table geometry) and Mojo
