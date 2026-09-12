@@ -35,26 +35,30 @@ def io_write32(port: UInt16, value: UInt32):
 
 
 @always_inline
-def config_address(bus: UInt8, device: UInt8, function: UInt8, offset: UInt8) -> UInt32:
+def config_address(
+    bus: UInt8, device: UInt8, function: UInt8, offset: UInt8
+) -> UInt32:
     return (
         0x80000000
         | (UInt32(bus) << 16)
         | (UInt32(device) << 11)
         | (UInt32(function) << 8)
-        | (UInt32(offset) & 0xfc)
+        | (UInt32(offset) & 0xFC)
     )
 
 
-def config_read32(bus: UInt8, device: UInt8, function: UInt8, offset: UInt8) -> UInt32:
-    io_write32(0xcf8, config_address(bus, device, function, offset))
-    return io_read32(0xcfc)
+def config_read32(
+    bus: UInt8, device: UInt8, function: UInt8, offset: UInt8
+) -> UInt32:
+    io_write32(0xCF8, config_address(bus, device, function, offset))
+    return io_read32(0xCFC)
 
 
 def find_device(vendor: UInt16, device_id: UInt16) -> Int:
     """Return bus-0 device number for a function-zero device, or -1."""
     for device in range(32):
         var id = config_read32(0, UInt8(device), 0, 0)
-        if UInt16(id & 0xffff) == vendor and UInt16(id >> 16) == device_id:
+        if UInt16(id & 0xFFFF) == vendor and UInt16(id >> 16) == device_id:
             return device
     return -1
 
@@ -64,4 +68,4 @@ def io_bar0(device: Int) -> UInt16:
     var bar = config_read32(0, UInt8(device), 0, 0x10)
     if (bar & 1) == 0:
         return 0
-    return UInt16(bar & 0xfffc)
+    return UInt16(bar & 0xFFFC)

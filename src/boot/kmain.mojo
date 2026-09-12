@@ -184,11 +184,9 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
         var blk = VirtioBlk()
         var found = False
         for i in range(candidates):
-            var base = (
-                bp.virtio_mmio_bases[i]
-                if bp.virtio_mmio_count != 0
-                else UInt64(0x0A000000 + i * 0x200)
-            )
+            var base = bp.virtio_mmio_bases[
+                i
+            ] if bp.virtio_mmio_count != 0 else UInt64(0x0A000000 + i * 0x200)
             if blk.init(alloc, base):
                 found = True
                 print_str("[virtio-blk] capacity=")

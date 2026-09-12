@@ -20,7 +20,6 @@ comptime ARCH = get_defined_string[
 ]()
 
 
-
 # ------------------------------------------------------------------------
 # Centralized Darwin Syscall Dispatchers
 # ------------------------------------------------------------------------
@@ -117,7 +116,9 @@ def write(fd: Int32, buf: Int, len: UInt64) -> UInt64:
 
 @export
 def open(path: Int, flags: Int32, mode: Int32) -> Int32:
-    var res = darwin_syscall3(BSD_SYS_OPEN, UInt64(path), UInt64(flags), UInt64(mode))
+    var res = darwin_syscall3(
+        BSD_SYS_OPEN, UInt64(path), UInt64(flags), UInt64(mode)
+    )
     return Int32(res)
 
 

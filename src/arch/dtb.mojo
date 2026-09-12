@@ -47,7 +47,9 @@ struct BootParams:
         self.cmdline_addr = 0
         self.cmdline_len = 0
         self.virtio_mmio_count = 0
-        self.virtio_mmio_bases = Array[UInt64, VIRTIO_MMIO_MAX](uninitialized=True)
+        self.virtio_mmio_bases = Array[UInt64, VIRTIO_MMIO_MAX](
+            uninitialized=True
+        )
 
 
 struct MemRegions:
@@ -114,7 +116,6 @@ def add_virtio_mmio(mut bp: BootParams, base: UInt64):
     if bp.virtio_mmio_count < VIRTIO_MMIO_MAX:
         bp.virtio_mmio_bases[bp.virtio_mmio_count] = base
         bp.virtio_mmio_count += 1
-
 
 
 def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
@@ -209,7 +210,9 @@ def parse_dtb(dtb: Int, mut mem: MemRegions) -> BootParams:
                     left -= (acroot + scroot) * 4
                     mem.add(b, s)
             elif in_virtio_mmio:
-                if cstr_eq(pname, "compatible") and cstr_eq(data, "virtio,mmio"):
+                if cstr_eq(pname, "compatible") and cstr_eq(
+                    data, "virtio,mmio"
+                ):
                     virtio_is_compatible = True
                 elif cstr_eq(pname, "reg") and plen >= (acroot + scroot) * 4:
                     virtio_base = read_cells(data, acroot)

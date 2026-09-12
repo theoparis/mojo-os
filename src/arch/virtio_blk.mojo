@@ -5,7 +5,17 @@
 # protocol before a filesystem consumes it.
 from std.ffi import external_call
 
-from arch.mem import read_u8, read_u16, read_u32, read_u64, volatile_read_u16, write_u8, write_u16, write_u32, write_u64
+from arch.mem import (
+    read_u8,
+    read_u16,
+    read_u32,
+    read_u64,
+    volatile_read_u16,
+    write_u8,
+    write_u16,
+    write_u32,
+    write_u64,
+)
 from mm.phys import PhysAlloc
 
 comptime VIRTIO_MAGIC: UInt32 = 0x74726976
@@ -83,7 +93,12 @@ struct VirtioBlk:
         write_u32(reg(base, 0x020), 0)
         write_u32(reg(base, 0x024), 1)
         write_u32(reg(base, 0x020), VIRTIO_F_VERSION_1)
-        write_u32(reg(base, 0x070), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+        write_u32(
+            reg(base, 0x070),
+            VIRTIO_STATUS_ACK
+            | VIRTIO_STATUS_DRIVER
+            | VIRTIO_STATUS_FEATURES_OK,
+        )
         if (read_u32(reg(base, 0x070)) & VIRTIO_STATUS_FEATURES_OK) == 0:
             return False
 
@@ -98,18 +113,31 @@ struct VirtioBlk:
         self.desc = queue
         self.avail = self.desc + UInt64(VIRTQ_DESC_SIZE * VIRTQ_SIZE)
         self.used = (self.avail + UInt64(4 + VIRTQ_SIZE * 2) + 3) & ~UInt64(3)
-        for off in range(4 + VIRTQ_SIZE * VIRTQ_DESC_SIZE + 4 + VIRTQ_SIZE * 2 + 4 + VIRTQ_SIZE * 8):
+        for off in range(
+            4
+            + VIRTQ_SIZE * VIRTQ_DESC_SIZE
+            + 4
+            + VIRTQ_SIZE * 2
+            + 4
+            + VIRTQ_SIZE * 8
+        ):
             write_u8(Int(self.desc) + off, 0)
         write_u32(reg(base, 0x038), UInt32(VIRTQ_SIZE))
         write_u32(reg(base, 0x080), UInt32(self.desc))
         write_u32(reg(base, 0x084), UInt32(self.desc >> 32))
         write_u32(reg(base, 0x090), UInt32(self.avail))
         write_u32(reg(base, 0x094), UInt32(self.avail >> 32))
-        write_u32(reg(base, 0x0a0), UInt32(self.used))
-        write_u32(reg(base, 0x0a4), UInt32(self.used >> 32))
+        write_u32(reg(base, 0x0A0), UInt32(self.used))
+        write_u32(reg(base, 0x0A4), UInt32(self.used >> 32))
         barrier()
         write_u32(reg(base, 0x044), 1)
-        write_u32(reg(base, 0x070), VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK)
+        write_u32(
+            reg(base, 0x070),
+            VIRTIO_STATUS_ACK
+            | VIRTIO_STATUS_DRIVER
+            | VIRTIO_STATUS_FEATURES_OK
+            | VIRTIO_STATUS_DRIVER_OK,
+        )
         self.capacity_sectors = read_u64(Int(base) + 0x100)
         self.ready = True
         return True
@@ -122,7 +150,7 @@ struct VirtioBlk:
         write_u32(Int(self.request), VIRTIO_BLK_T_IN)
         write_u32(Int(self.request + 4), 0)
         write_u64(Int(self.request + 8), sector)
-        write_u8(Int(self.request + 16), 0xff)  # request status byte
+        write_u8(Int(self.request + 16), 0xFF)  # request status byte
 
         # Three descriptors: request header -> data-in -> status byte.
         write_u64(Int(self.desc), self.request)
@@ -139,7 +167,10 @@ struct VirtioBlk:
         write_u16(Int(self.desc + 46), 0)
 
         var avail_idx = read_u16(Int(self.avail + 2))
-        write_u16(Int(self.avail + 4 + UInt64((avail_idx % UInt16(VIRTQ_SIZE)) * 2)), 0)
+        write_u16(
+            Int(self.avail + 4 + UInt64((avail_idx % UInt16(VIRTQ_SIZE)) * 2)),
+            0,
+        )
         barrier()
         avail_idx += 1
         write_u16(Int(self.avail + 2), avail_idx)

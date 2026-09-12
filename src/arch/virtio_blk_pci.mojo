@@ -1,11 +1,27 @@
 # Minimal synchronous VirtIO block driver using the transitional PCI device's
 # legacy I/O-port interface. QEMU exposes this as virtio-blk-pci-transitional.
-from arch.mem import read_u8, read_u16, volatile_read_u16, write_u8, write_u16, write_u32, write_u64
-from arch.pci import find_device, io_bar0, io_read16, io_read32, io_write8, io_write16, io_write32
+from arch.mem import (
+    read_u8,
+    read_u16,
+    volatile_read_u16,
+    write_u8,
+    write_u16,
+    write_u32,
+    write_u64,
+)
+from arch.pci import (
+    find_device,
+    io_bar0,
+    io_read16,
+    io_read32,
+    io_write8,
+    io_write16,
+    io_write32,
+)
 from arch.virtio_blk import sync_dma, wait_for_device
 from mm.phys import PhysAlloc
 
-comptime VIRTIO_VENDOR: UInt16 = 0x1af4
+comptime VIRTIO_VENDOR: UInt16 = 0x1AF4
 comptime VIRTIO_BLK_LEGACY_DEVICE: UInt16 = 0x1001
 comptime QUEUE_SIZE: Int = 256
 comptime DESC_F_NEXT: UInt16 = 1
@@ -62,7 +78,9 @@ struct VirtioBlkPci:
         for i in range(12288):
             write_u8(Int(queue) + i, 0)
         io_write32(self.io + 8, UInt32(queue >> 12))
-        self.capacity_sectors = UInt64(io_read32(self.io + 20)) | (UInt64(io_read32(self.io + 24)) << 32)
+        self.capacity_sectors = UInt64(io_read32(self.io + 20)) | (
+            UInt64(io_read32(self.io + 24)) << 32
+        )
         io_write8(self.io + 18, 1 | 2 | 4)
         self.ready = True
         return True
@@ -73,7 +91,7 @@ struct VirtioBlkPci:
         write_u32(Int(self.request), 0)
         write_u32(Int(self.request + 4), 0)
         write_u64(Int(self.request + 8), sector)
-        write_u8(Int(self.request + 16), 0xff)
+        write_u8(Int(self.request + 16), 0xFF)
 
         write_u64(Int(self.desc), self.request)
         write_u32(Int(self.desc + 8), 16)
@@ -89,7 +107,9 @@ struct VirtioBlkPci:
         write_u16(Int(self.desc + 46), 0)
 
         var idx = read_u16(Int(self.avail + 2))
-        write_u16(Int(self.avail + 4 + UInt64((idx % UInt16(QUEUE_SIZE)) * 2)), 0)
+        write_u16(
+            Int(self.avail + 4 + UInt64((idx % UInt16(QUEUE_SIZE)) * 2)), 0
+        )
         idx += 1
         write_u16(Int(self.avail + 2), idx)
         sync_dma(self.desc, 48)
