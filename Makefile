@@ -36,10 +36,11 @@ QEMU_CPU     ?= $(if $(filter 14,$(PAGE_SHIFT)),cortex-a76,cortex-a57)
 # MOJOFLAGS. See docs/16k-pages.md.
 PAGE_SHIFT   ?= 12
 
+OPTIMIZATION_LEVEL ?= 1
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -DPAGE_SHIFT=$(PAGE_SHIFT) -c
-MOJOFLAGS    := --optimization-level 1 -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := --optimization-level $(OPTIMIZATION_LEVEL) -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 # Freestanding userspace binaries are compiled with clang for a bare
 # `-none-` triple (no OS, no libc) and linked as static non-PIE ET_EXEC by
@@ -65,7 +66,7 @@ UEFI_APP         := $(UEFI_DIR)/BOOTX64.EFI
 UEFI_ESP         := $(UEFI_DIR)/esp
 UEFI_BOOT_APP    := $(UEFI_ESP)/EFI/BOOT/BOOTX64.EFI
 UEFI_KERNEL_ELF  := $(UEFI_ESP)/kernel.elf
-UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) --optimization-level $(OPTIMIZATION_LEVEL) -I src -I . --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
 
 # Mojo emits ARM64 COFF through its Windows target; the native aarch64 UEFI
 # backend does not yet support COFF emission.
@@ -74,7 +75,7 @@ UEFI_AA64_ESP       := $(UEFI_AA64_DIR)/esp
 UEFI_AA64_BOOT_APP  := $(UEFI_AA64_ESP)/EFI/BOOT/BOOTAA64.EFI
 UEFI_AA64_KERNEL    := $(UEFI_AA64_ESP)/kernel.elf
 UEFI_AA64_INITRD    := $(UEFI_AA64_ESP)/initrd.cpio
-UEFI_AA64_MOJOFLAGS := -D ARCH=aarch64 $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=aarch64-unknown-windows --mcpu=cortex-a57
+UEFI_AA64_MOJOFLAGS := -D ARCH=aarch64 $(MOJO_ASSERT) $(MOJO_SEARCH) --optimization-level $(OPTIMIZATION_LEVEL) -I src -I . --emit object --target-triple=aarch64-unknown-windows --mcpu=cortex-a57
 QEMU_AA64_EFI       ?= /usr/share/edk2/aarch64/QEMU_EFI.fd
 
 X86_TARGET       := x86_64-unknown-none-elf
@@ -83,14 +84,13 @@ X86_KERNEL_ELF   := $(BUILD_DIR)/kernel_x86_64.elf
 X86_OBJS         := $(BUILD_DIR)/boot_x86_64.o $(BUILD_DIR)/kernel_x86_64.o
 X86_LINKER_SCRIPT:= src/linker_x86_64.ld
 X86_ASFLAGS      := --target=$(X86_TARGET) -c
-X86_MOJOFLAGS    := -D ARCH=x86_64 -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(X86_TARGET) --mcpu=$(X86_CPU)
+X86_MOJOFLAGS    := -D ARCH=x86_64 -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) --optimization-level $(OPTIMIZATION_LEVEL) -I src -I . --emit object --target-triple=$(X86_TARGET) --mcpu=$(X86_CPU)
 
 QEMU_X86         ?= qemu-system-x86_64
 # `-bios` needs a monolithic firmware image. Override this for distributions
 # that package an equivalent image at a different path.
 OVMF_CODE        ?= $(firstword $(wildcard /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF.fd))
 
-INIT_ELF     := $(BUILD_DIR)/init
 INITRD       := $(BUILD_DIR)/initrd.cpio
 MKCPIO       := $(MOJO_RT_ENV) $(MOJO) run $(MOJO_SEARCH) -I src tools/mkcpio.mojo
 
@@ -203,34 +203,28 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 # Userspace + initrd (Linux-style boot target)
 # ------------------------------------------------------------------------
 
-# /init for the ramfs: a tiny freestanding binary that tests Darwin syscalls & Mach traps.
-$(INIT_ELF): src/user/init.c src/user/user.ld | $(BUILD_DIR)
-	$(USER_CC) --target=$(USER_TARGET) -ffreestanding -fno-builtin -fuse-ld=lld \
-		-nostdlib -static -fno-pie -O2 -Wall \
-		-Wl,-T,src/user/user.ld -o $@ $<
-
 # Build the dynamic macOS arm64 libSystem.dylib written in Mojo
 $(INIT_DYLIB): src/user/libsystem.mojo | $(BUILD_DIR)
-	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) --target-triple=arm64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem.o
-	ld64.lld -arch arm64 -platform_version macos 11.0 11.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem.o -o $@
+	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) -I src --target-triple=arm64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem.o
+	ld64.lld -arch arm64 -platform_version macos 27.0 27.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem.o -o $@
 	ln -sf libSystem.B.dylib $(BUILD_DIR)/libSystem.dylib
 
 $(INIT_MACHO): src/user/init.c $(INIT_DYLIB) | $(BUILD_DIR)
 	clang --target=aarch64-apple-darwin -fuse-ld=lld \
 		-fno-stack-protector \
-		-Wl,-platform_version,macos,11.0,11.0 \
+		-Wl,-platform_version,macos,27.0,27.0 \
 		-Wl,-pagezero_size,0x10000 \
 		-Wl,-fixup_chains \
 		-L$(BUILD_DIR) -lSystem \
 		src/user/init.c -o $@
 
 $(X86_INIT_DYLIB): src/user/libsystem.mojo | $(BUILD_DIR)
-	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) --target-triple=x86_64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem_x86_64.o
-	ld64.lld -arch x86_64 -platform_version macos 11.0 11.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem_x86_64.o -o $@
+	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) -I src --target-triple=x86_64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem_x86_64.o
+	ld64.lld -arch x86_64 -platform_version macos 27.0 27.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem_x86_64.o -o $@
 
 $(X86_INIT_MACHO): src/user/init.c $(X86_INIT_DYLIB) | $(BUILD_DIR)
 	clang --target=x86_64-apple-darwin -fuse-ld=lld -fno-stack-protector -nostdlib \
-		-Wl,-e,_main -Wl,-platform_version,macos,11.0,11.0 -Wl,-pagezero_size,0x10000 \
+		-Wl,-e,_main -Wl,-platform_version,macos,27.0,27.0 -Wl,-pagezero_size,0x10000 \
 		-Wl,-fixup_chains -L$(BUILD_DIR) -lSystem.B_x86_64 $< -o $@
 
 $(X86_INITRD): tools/mkcpio.mojo src/fs/cpio.mojo $(X86_INIT_MACHO) $(X86_INIT_DYLIB)

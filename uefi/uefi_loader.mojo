@@ -446,7 +446,6 @@ def uefi_load_and_boot(
 
     while True:
         pass
-    return EFI_SUCCESS
 
 
 @export("memset")
