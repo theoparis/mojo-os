@@ -87,6 +87,8 @@ from .macho import (
     macho_image_end,
     macho_is_valid,
     macho_lookup_symbol,
+    macho_load_bounds,
+    macho_load_image,
     macho_ncmds,
     macho_read_u16,
     macho_read_u32,

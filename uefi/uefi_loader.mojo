@@ -1,14 +1,26 @@
-# Pure Mojo UEFI ELF loader implementing standard UEFI structs with @fieldwise_init
-# Uses the freestanding `loader` package to parse and load ELF64 kernels.
+# Pure Mojo UEFI loader implementing standard UEFI structs with @fieldwise_init
+# Supports both ELF64 and Mach-O 64-bit kernels on x86_64 and AArch64.
 from std.memory import Pointer
+from std.origin import MutUntrackedOrigin
+from std.sys.info import CompilationTarget
 
+from arch.afdt_builder import DTBuilder
+from arch.xnu_boot import SIZEOF_BOOT_ARGS, init_boot_args
 from loader import (
+    CPU_TYPE_ARM64,
+    CPU_TYPE_X86_64,
+    EM_AARCH64,
     EM_X86_64,
     elf_entry,
     elf_is_valid,
     elf_load_bounds,
     elf_load_image,
     elf_machine,
+    macho_cputype,
+    macho_find_entry,
+    macho_is_valid,
+    macho_load_bounds,
+    macho_load_image,
 )
 
 comptime EFI_SUCCESS: UInt64 = 0
@@ -167,6 +179,68 @@ comptime FILE_INFO_ID = EFI_GUID(
 )
 
 
+def load_file(
+    bs: Pointer[EFI_BOOT_SERVICES, MutUntrackedOrigin],
+    root: Pointer[EFI_FILE_PROTOCOL, MutAnyOrigin],
+    filename_u16: Pointer[UInt16, MutAnyOrigin],
+    mut out_buf: EFI_HANDLE,
+    mut out_size: UInt64,
+) -> EFI_STATUS:
+    var info_guid = FILE_INFO_ID
+    var file_handle: EFI_HANDLE = 0
+    var status = root[].Open(
+        root, any_ptr(file_handle), filename_u16, EFI_FILE_MODE_READ, 0
+    )
+    if status != EFI_SUCCESS:
+        return status
+
+    var file = Pointer[EFI_FILE_PROTOCOL, MutAnyOrigin](
+        unsafe_from_address=file_handle
+    )
+    var info_size: UInt64 = 0
+    status = file[].GetInfo(file, any_ptr(info_guid), any_ptr(info_size), 0)
+    if status != EFI_BUFFER_TOO_SMALL:
+        _ = file[].Close(file)
+        return status
+
+    var meta_handle: EFI_HANDLE = 0
+    status = bs[].AllocatePool(2, info_size, any_ptr(meta_handle))
+    if status != EFI_SUCCESS:
+        _ = file[].Close(file)
+        return status
+
+    status = file[].GetInfo(
+        file, any_ptr(info_guid), any_ptr(info_size), meta_handle
+    )
+    if status != EFI_SUCCESS:
+        _ = bs[].FreePool(meta_handle)
+        _ = file[].Close(file)
+        return status
+
+    var file_info = Pointer[EFI_FILE_INFO, MutAnyOrigin](
+        unsafe_from_address=meta_handle
+    )
+    var file_size = file_info[].FileSize
+    _ = bs[].FreePool(meta_handle)
+
+    var raw_buf: EFI_HANDLE = 0
+    status = bs[].AllocatePool(2, file_size, any_ptr(raw_buf))
+    if status != EFI_SUCCESS:
+        _ = file[].Close(file)
+        return status
+
+    var read_bytes = file_size
+    status = file[].Read(file, any_ptr(read_bytes), raw_buf)
+    _ = file[].Close(file)
+    if status != EFI_SUCCESS or read_bytes != file_size:
+        _ = bs[].FreePool(raw_buf)
+        return status if status != EFI_SUCCESS else EFI_LOAD_ERROR
+
+    out_buf = raw_buf
+    out_size = file_size
+    return EFI_SUCCESS
+
+
 @export("uefi_load_and_boot")
 def uefi_load_and_boot(
     image_handle: EFI_HANDLE, sys_table: Pointer[EFI_SYSTEM_TABLE, MutAnyOrigin]
@@ -175,7 +249,6 @@ def uefi_load_and_boot(
 
     var loaded_guid = LOADED_IMAGE_PROTOCOL_GUID
     var fs_guid = SIMPLE_FILE_SYSTEM_PROTOCOL_GUID
-    var info_guid = FILE_INFO_ID
 
     var li_handle: EFI_HANDLE = 0
     var status = bs[].HandleProtocol(
@@ -206,8 +279,33 @@ def uefi_load_and_boot(
         unsafe_from_address=root_handle
     )
 
-    # Primary path: \kernel.elf
-    var path_kernel: Array[UInt16, 12] = [
+    # 1. Try loading ramdisk: \initrd.cpio
+    var ramdisk_u16: Array[UInt16, 13] = [
+        UInt16(ord("\\")),
+        UInt16(ord("i")),
+        UInt16(ord("n")),
+        UInt16(ord("i")),
+        UInt16(ord("t")),
+        UInt16(ord("r")),
+        UInt16(ord("d")),
+        UInt16(ord(".")),
+        UInt16(ord("c")),
+        UInt16(ord("p")),
+        UInt16(ord("i")),
+        UInt16(ord("o")),
+        UInt16(0),
+    ]
+    var ramdisk_ptr = Pointer[UInt16, MutAnyOrigin](
+        unsafe_from_address=Int(Pointer(to=ramdisk_u16))
+    )
+    var rd_buf: EFI_HANDLE = 0
+    var rd_size: UInt64 = 0
+    var has_rd = (
+        load_file(bs, root, ramdisk_ptr, rd_buf, rd_size) == EFI_SUCCESS
+    )
+
+    # 2. Try loading kernel: \kernel.macho, fallback \kernel.elf
+    var path_macho: Array[UInt16, 14] = [
         UInt16(ord("\\")),
         UInt16(ord("k")),
         UInt16(ord("e")),
@@ -216,115 +314,138 @@ def uefi_load_and_boot(
         UInt16(ord("e")),
         UInt16(ord("l")),
         UInt16(ord(".")),
-        UInt16(ord("e")),
-        UInt16(ord("l")),
-        UInt16(ord("f")),
+        UInt16(ord("m")),
+        UInt16(ord("a")),
+        UInt16(ord("c")),
+        UInt16(ord("h")),
+        UInt16(ord("o")),
         UInt16(0),
     ]
-    var path_ptr = Pointer[UInt16, MutAnyOrigin](
-        unsafe_from_address=Int(Pointer(to=path_kernel))
+    var macho_ptr = Pointer[UInt16, MutAnyOrigin](
+        unsafe_from_address=Int(Pointer(to=path_macho))
     )
-    var file_handle: EFI_HANDLE = 0
-    status = root[].Open(
-        root, any_ptr(file_handle), path_ptr, EFI_FILE_MODE_READ, 0
-    )
-    if status != EFI_SUCCESS:
-        # Fallback path: \MOJOOS.ELF
-        var path_fallback: Array[UInt16, 12] = [
+    var k_buf: EFI_HANDLE = 0
+    var k_size: UInt64 = 0
+    var is_macho = load_file(bs, root, macho_ptr, k_buf, k_size) == EFI_SUCCESS
+
+    if not is_macho:
+        var path_elf: Array[UInt16, 12] = [
             UInt16(ord("\\")),
-            UInt16(ord("M")),
-            UInt16(ord("O")),
-            UInt16(ord("J")),
-            UInt16(ord("O")),
-            UInt16(ord("O")),
-            UInt16(ord("S")),
+            UInt16(ord("k")),
+            UInt16(ord("e")),
+            UInt16(ord("r")),
+            UInt16(ord("n")),
+            UInt16(ord("e")),
+            UInt16(ord("l")),
             UInt16(ord(".")),
-            UInt16(ord("E")),
-            UInt16(ord("L")),
-            UInt16(ord("F")),
+            UInt16(ord("e")),
+            UInt16(ord("l")),
+            UInt16(ord("f")),
             UInt16(0),
         ]
-        var fb_ptr = Pointer[UInt16, MutAnyOrigin](
-            unsafe_from_address=Int(Pointer(to=path_fallback))
+        var elf_ptr = Pointer[UInt16, MutAnyOrigin](
+            unsafe_from_address=Int(Pointer(to=path_elf))
         )
-        status = root[].Open(
-            root, any_ptr(file_handle), fb_ptr, EFI_FILE_MODE_READ, 0
-        )
+        status = load_file(bs, root, elf_ptr, k_buf, k_size)
         if status != EFI_SUCCESS:
             return 0x400 | status
 
-    var file = Pointer[EFI_FILE_PROTOCOL, MutAnyOrigin](
-        unsafe_from_address=file_handle
-    )
-    var info_size: UInt64 = 0
-    status = file[].GetInfo(file, any_ptr(info_guid), any_ptr(info_size), 0)
-    if status != EFI_BUFFER_TOO_SMALL:
-        return 0x500 | status
-
-    var meta_handle: EFI_HANDLE = 0
-    status = bs[].AllocatePool(2, info_size, any_ptr(meta_handle))
-    if status != EFI_SUCCESS:
-        return status
-
-    status = file[].GetInfo(
-        file, any_ptr(info_guid), any_ptr(info_size), meta_handle
-    )
-    if status != EFI_SUCCESS:
-        return status
-
-    var file_info = Pointer[EFI_FILE_INFO, MutAnyOrigin](
-        unsafe_from_address=meta_handle
-    )
-    var file_size = file_info[].FileSize
-    _ = bs[].FreePool(meta_handle)
-
-    var raw_buf: EFI_HANDLE = 0
-    status = bs[].AllocatePool(2, file_size, any_ptr(raw_buf))
-    if status != EFI_SUCCESS:
-        return status
-
-    var read_bytes = file_size
-    status = file[].Read(file, any_ptr(read_bytes), raw_buf)
-    _ = file[].Close(file)
-    if status != EFI_SUCCESS or read_bytes != file_size:
-        return status if status != EFI_SUCCESS else EFI_LOAD_ERROR
-
-    # Validate ELF header via freestanding loader package
-    if not elf_is_valid(raw_buf):
-        return EFI_LOAD_ERROR
-    if elf_machine(raw_buf) != EM_X86_64:
-        return EFI_LOAD_ERROR
-
-    # Determine required memory bounds for PT_LOAD segments
+    # Determine load bounds
     var min_vaddr: UInt64 = 0
     var max_vaddr: UInt64 = 0
-    if not elf_load_bounds(raw_buf, min_vaddr, max_vaddr):
-        return EFI_LOAD_ERROR
+    var entry_addr: Int = 0
 
-    var page_count = (max_vaddr - min_vaddr + 4095) // 4096
-    var alloc_addr: UInt64 = min_vaddr
-    # Try AllocateAddress first (Type 2 = AllocateAddress, MemoryType 2 = EfiLoaderData)
-    status = bs[].AllocatePages(2, 2, page_count, any_ptr(alloc_addr))
-    if status != EFI_SUCCESS:
-        # Fallback to AllocateAnyPages (Type 0)
-        status = bs[].AllocatePages(0, 2, page_count, any_ptr(alloc_addr))
+    if is_macho or macho_is_valid(k_buf):
+        if not macho_load_bounds(k_buf, min_vaddr, max_vaddr):
+            return EFI_LOAD_ERROR
+        var page_count = (max_vaddr - min_vaddr + 4095) // 4096
+        var alloc_addr: UInt64 = min_vaddr
+        status = bs[].AllocatePages(2, 1, page_count, any_ptr(alloc_addr))
         if status != EFI_SUCCESS:
-            return status
-
-    var load_bias = Int(alloc_addr - min_vaddr)
-    if not elf_load_image(raw_buf, load_bias):
+            status = bs[].AllocatePages(0, 1, page_count, any_ptr(alloc_addr))
+            if status != EFI_SUCCESS:
+                return status
+        var load_bias = Int(alloc_addr - min_vaddr)
+        if not macho_load_image(k_buf, load_bias):
+            return EFI_LOAD_ERROR
+        entry_addr = Int(macho_find_entry(k_buf)) + load_bias
+    elif elf_is_valid(k_buf):
+        if not elf_load_bounds(k_buf, min_vaddr, max_vaddr):
+            return EFI_LOAD_ERROR
+        var page_count = (max_vaddr - min_vaddr + 4095) // 4096
+        var alloc_addr: UInt64 = min_vaddr
+        status = bs[].AllocatePages(2, 1, page_count, any_ptr(alloc_addr))
+        if status != EFI_SUCCESS:
+            status = bs[].AllocatePages(0, 1, page_count, any_ptr(alloc_addr))
+            if status != EFI_SUCCESS:
+                return status
+        var load_bias = Int(alloc_addr - min_vaddr)
+        if not elf_load_image(k_buf, load_bias):
+            return EFI_LOAD_ERROR
+        entry_addr = Int(elf_entry(k_buf)) + load_bias
+    else:
         return EFI_LOAD_ERROR
 
-    var entry_addr = Int(elf_entry(raw_buf)) + load_bias
+    _ = bs[].FreePool(k_buf)
 
-    _ = bs[].FreePool(raw_buf)
+    # 3. Build XNU Flattened Device Tree with /chosen/memory-map RAMDisk property
+    var dt_buf: EFI_HANDLE = 0
+    var dt_size: UInt64 = 4096
+    status = bs[].AllocatePool(2, dt_size, any_ptr(dt_buf))
+    if status != EFI_SUCCESS:
+        return status
 
-    # Transfer control to kernel entry point
+    var dt = DTBuilder(dt_buf, Int(dt_size))
+    # Root node: 1 property ("name" = ""), 1 child ("chosen")
+    dt.add_node_header(1, 1)
+    dt.add_string_property("name", "")
+
+    # Child: "chosen": 1 property ("name" = "chosen"), 1 child ("memory-map")
+    dt.add_node_header(1, 1)
+    dt.add_string_property("name", "chosen")
+
+    # Child: "memory-map": 2 properties ("name" = "memory-map", "RAMDisk" = [base, size]), 0 children
+    if has_rd:
+        dt.add_node_header(2, 0)
+        dt.add_string_property("name", "memory-map")
+        dt.add_u64_pair_property("RAMDisk", UInt64(rd_buf), rd_size)
+    else:
+        dt.add_node_header(1, 0)
+        dt.add_string_property("name", "memory-map")
+
+    # 4. Allocate and construct XNU boot_args structure
+    var ba_buf: EFI_HANDLE = 0
+    status = bs[].AllocatePool(2, UInt64(SIZEOF_BOOT_ARGS), any_ptr(ba_buf))
+    if status != EFI_SUCCESS:
+        return status
+
+    var phys_base: UInt64 = 0x40000000
+    var mem_size: UInt64 = 256 * 1024 * 1024
+    comptime if StringLiteral[
+        CompilationTarget[].__triple_arch()
+    ]() == "x86_64":
+        # q35 conventional RAM starts at physical zero. Keep the first MiB
+        # reserved for firmware/legacy regions; this also covers EFI pools.
+        phys_base = 0x100000
+        mem_size = 127 * 1024 * 1024
+    init_boot_args(
+        ba_buf,
+        phys_base,
+        mem_size,
+        max_vaddr,
+        UInt64(dt_buf),
+        UInt32(dt.size()),
+        "console=ttyAMA0 rdinit=/init",
+    )
+
+    # Transfer control to kernel entry point with boot_args in argument 0
     var entry_fn = Pointer[Int](to=entry_addr).unsafe_bitcast[
-        def(Pointer[EFI_SYSTEM_TABLE, MutAnyOrigin]) thin abi("C") -> NoneType
+        def(Int, Int, Int, Int) thin abi("C") -> NoneType
     ]()[]
-    entry_fn(sys_table)
+    entry_fn(ba_buf, Int(min_vaddr), Int(max_vaddr), 0)
 
+    while True:
+        pass
     return EFI_SUCCESS
 
 

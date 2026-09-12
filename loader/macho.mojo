@@ -310,3 +310,57 @@ def macho_image_end(base: Int) -> Int:
                 end = e
         curr += cmdsize
     return end
+
+
+def macho_load_bounds(
+    base: Int, mut min_addr: UInt64, mut max_addr: UInt64
+) -> Bool:
+    """Find extent covering all loadable (non-PAGEZERO) 64-bit segments."""
+    if not macho_is_valid(base):
+        return False
+    var curr = base + 32
+    var found = False
+    var low: UInt64 = 0xFFFFFFFFFFFFFFFF
+    var high: UInt64 = 0
+    for _ in range(Int(macho_ncmds(base))):
+        var cmd = macho_read_u32(curr)
+        var cmdsize = Int(macho_read_u32(curr + 4))
+        if cmd == LC_SEGMENT_64:
+            var vmsize = macho_read_u64(curr + 32)
+            # PAGEZERO has no permissions and must not be allocated.
+            var initprot = macho_read_u32(curr + 60)
+            if vmsize != 0 and initprot != 0:
+                var vmaddr = macho_read_u64(curr + 24)
+                if vmaddr < low:
+                    low = vmaddr
+                if vmaddr + vmsize > high:
+                    high = vmaddr + vmsize
+                found = True
+        curr += cmdsize
+    if found:
+        min_addr = low
+        max_addr = high
+    return found
+
+
+def macho_load_image(base: Int, load_bias: Int = 0) -> Bool:
+    """Copy each loadable LC_SEGMENT_64 and clear its BSS tail."""
+    if not macho_is_valid(base):
+        return False
+    var curr = base + 32
+    for _ in range(Int(macho_ncmds(base))):
+        var cmd = macho_read_u32(curr)
+        var cmdsize = Int(macho_read_u32(curr + 4))
+        if cmd == LC_SEGMENT_64:
+            var vmsize = Int(macho_read_u64(curr + 32))
+            var initprot = macho_read_u32(curr + 60)
+            if vmsize != 0 and initprot != 0:
+                var dst = Int(macho_read_u64(curr + 24)) + load_bias
+                var src = base + Int(macho_read_u64(curr + 40))
+                var filesize = Int(macho_read_u64(curr + 48))
+                for b in range(filesize):
+                    macho_write_u8(dst + b, macho_read_u8(src + b))
+                for b in range(filesize, vmsize):
+                    macho_write_u8(dst + b, 0)
+        curr += cmdsize
+    return True

@@ -39,7 +39,7 @@ PAGE_SHIFT   ?= 12
 TARGET       ?= aarch64-unknown-none-elf
 TARGET_CPU   := cortex-a57
 ASFLAGS      := --target=$(TARGET) -march=armv8-a -DPAGE_SHIFT=$(PAGE_SHIFT) -c
-MOJOFLAGS    := -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
+MOJOFLAGS    := --optimization-level 1 -D PAGE_SHIFT=$(PAGE_SHIFT) $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(TARGET) --mcpu=$(TARGET_CPU)
 
 # Freestanding userspace binaries are compiled with clang for a bare
 # `-none-` triple (no OS, no libc) and linked as static non-PIE ET_EXEC by
@@ -65,7 +65,17 @@ UEFI_APP         := $(UEFI_DIR)/BOOTX64.EFI
 UEFI_ESP         := $(UEFI_DIR)/esp
 UEFI_BOOT_APP    := $(UEFI_ESP)/EFI/BOOT/BOOTX64.EFI
 UEFI_KERNEL_ELF  := $(UEFI_ESP)/kernel.elf
-UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) -I . --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+UEFI_MOJOFLAGS   := $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=$(UEFI_TARGET) --mcpu=$(UEFI_CPU)
+
+# Mojo emits ARM64 COFF through its Windows target; the native aarch64 UEFI
+# backend does not yet support COFF emission.
+UEFI_AA64_DIR       := $(BUILD_DIR)/uefi-aa64
+UEFI_AA64_ESP       := $(UEFI_AA64_DIR)/esp
+UEFI_AA64_BOOT_APP  := $(UEFI_AA64_ESP)/EFI/BOOT/BOOTAA64.EFI
+UEFI_AA64_KERNEL    := $(UEFI_AA64_ESP)/kernel.elf
+UEFI_AA64_INITRD    := $(UEFI_AA64_ESP)/initrd.cpio
+UEFI_AA64_MOJOFLAGS := -D ARCH=aarch64 $(MOJO_ASSERT) $(MOJO_SEARCH) -I src -I . --emit object --target-triple=aarch64-unknown-windows --mcpu=cortex-a57
+QEMU_AA64_EFI       ?= /usr/share/edk2/aarch64/QEMU_EFI.fd
 
 X86_TARGET       := x86_64-unknown-none-elf
 X86_CPU          := x86-64
@@ -87,16 +97,21 @@ MKCPIO       := $(MOJO_RT_ENV) $(MOJO) run $(MOJO_SEARCH) -I src tools/mkcpio.mo
 # User-space binaries to bundle into the initrd, as archive-name=path pairs.
 INIT_MACHO    := $(BUILD_DIR)/init_macho
 INIT_DYLIB    := $(BUILD_DIR)/libSystem.B.dylib
+X86_INIT_MACHO := $(BUILD_DIR)/init_macho_x86_64
+X86_INIT_DYLIB := $(BUILD_DIR)/libSystem.B_x86_64.dylib
+X86_INITRD     := $(BUILD_DIR)/initrd_x86_64.cpio
 
 INITRD_ENTRIES := init=$(INIT_MACHO) usr/lib/libSystem.B.dylib=$(INIT_DYLIB) usr/lib/libSystem.dylib=$(INIT_DYLIB)
 
-.PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi
+.PHONY: all clean run run-linux userspace uefi kernel-x86 run-uefi uefi-aa64 run-uefi-aa64
 
 all: $(KERNEL_ELF)
 
 kernel-x86: $(X86_KERNEL_ELF)
 
-uefi: $(UEFI_BOOT_APP) $(UEFI_KERNEL_ELF)
+uefi: $(UEFI_BOOT_APP) $(UEFI_KERNEL_ELF) $(UEFI_ESP)/initrd.cpio
+
+uefi-aa64: $(UEFI_AA64_BOOT_APP) $(UEFI_AA64_KERNEL) $(UEFI_AA64_INITRD)
 
 $(UEFI_DIR):
 	mkdir -p $@
@@ -127,11 +142,45 @@ $(UEFI_KERNEL_ELF): $(X86_KERNEL_ELF)
 	mkdir -p $(dir $@)
 	cp $< $@
 
+$(UEFI_ESP)/initrd.cpio: $(X86_INITRD)
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(UEFI_AA64_DIR):
+	mkdir -p $@
+
+$(UEFI_AA64_DIR)/main.o: uefi/main.mojo | $(UEFI_AA64_DIR)
+	$(MOJO) build $(UEFI_AA64_MOJOFLAGS) $< -o $@
+
+$(UEFI_AA64_DIR)/uefi_loader.o: uefi/uefi_loader.mojo | $(UEFI_AA64_DIR)
+	$(MOJO) build $(UEFI_AA64_MOJOFLAGS) $< -o $@
+
+$(UEFI_AA64_DIR)/BOOTAA64.EFI: $(UEFI_AA64_DIR)/main.o $(UEFI_AA64_DIR)/uefi_loader.o
+	$(LLD_LINK) /subsystem:efi_application /entry:efi_main /nodefaultlib /machine:arm64 /out:$@ $^
+
+$(UEFI_AA64_BOOT_APP): $(UEFI_AA64_DIR)/BOOTAA64.EFI
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(UEFI_AA64_KERNEL): $(KERNEL_ELF)
+	mkdir -p $(dir $@)
+	cp $< $@
+
+$(UEFI_AA64_INITRD): $(INITRD)
+	mkdir -p $(dir $@)
+	cp $< $@
+
 # OVMF_CODE can be overridden for distributions that store OVMF elsewhere.
-run-uefi: $(UEFI_BOOT_APP) $(UEFI_KERNEL_ELF)
+run-uefi: uefi
 	@test -n "$(OVMF_CODE)" || { echo "Set OVMF_CODE to a monolithic OVMF firmware image"; exit 1; }
 	$(QEMU_X86) -machine q35 -m 128M -nographic -bios $(OVMF_CODE) \
 		-drive format=raw,file=fat:rw:$(UEFI_ESP)
+
+run-uefi-aa64: uefi-aa64
+	@test -f "$(QEMU_AA64_EFI)" || { echo "Set QEMU_AA64_EFI to an AArch64 UEFI firmware image"; exit 1; }
+	$(QEMU) -M virt -cpu $(QEMU_CPU) -m 256M -nographic \
+		-drive if=pflash,format=raw,readonly=on,file=$(QEMU_AA64_EFI) \
+		-drive format=raw,file=fat:rw:$(UEFI_AA64_ESP)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -174,6 +223,18 @@ $(INIT_MACHO): src/user/init.c $(INIT_DYLIB) | $(BUILD_DIR)
 		-Wl,-fixup_chains \
 		-L$(BUILD_DIR) -lSystem \
 		src/user/init.c -o $@
+
+$(X86_INIT_DYLIB): src/user/libsystem.mojo | $(BUILD_DIR)
+	$(MOJO) build -DASSERT=none $(MOJO_SEARCH) --target-triple=x86_64-apple-darwin --emit object $< -o $(BUILD_DIR)/libsystem_x86_64.o
+	ld64.lld -arch x86_64 -platform_version macos 11.0 11.0 -dylib -install_name /usr/lib/libSystem.B.dylib $(BUILD_DIR)/libsystem_x86_64.o -o $@
+
+$(X86_INIT_MACHO): src/user/init.c $(X86_INIT_DYLIB) | $(BUILD_DIR)
+	clang --target=x86_64-apple-darwin -fuse-ld=lld -fno-stack-protector -nostdlib \
+		-Wl,-e,_main -Wl,-platform_version,macos,11.0,11.0 -Wl,-pagezero_size,0x10000 \
+		-Wl,-fixup_chains -L$(BUILD_DIR) -lSystem.B_x86_64 $< -o $@
+
+$(X86_INITRD): tools/mkcpio.mojo src/fs/cpio.mojo $(X86_INIT_MACHO) $(X86_INIT_DYLIB)
+	$(MKCPIO) $@ init=$(X86_INIT_MACHO) usr/lib/libSystem.B.dylib=$(X86_INIT_DYLIB) usr/lib/libSystem.dylib=$(X86_INIT_DYLIB)
 
 # The cpio initrd that QEMU loads and the kernel unpacks at boot.
 $(INITRD): tools/mkcpio.mojo src/fs/cpio.mojo $(INIT_MACHO) $(INIT_DYLIB)

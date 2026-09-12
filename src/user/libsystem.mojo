@@ -2,6 +2,12 @@
 # Uses centralized syscall helper functions with Darwin ARM64 ABI instead of
 # duplicate inline assembly in each exported API wrapper.
 from std.sys import inlined_assembly
+from std.sys.defines import get_defined_string
+from std.sys.info import CompilationTarget
+
+comptime ARCH = get_defined_string[
+    "ARCH", StringLiteral[CompilationTarget[].__triple_arch()]()
+]()
 
 # Darwin BSD Syscall Numbers
 comptime SYS_EXIT: Int64 = 1
@@ -26,46 +32,6 @@ comptime SYS_MMAP: Int64 = 197
 
 
 @always_inline
-def darwin_syscall0(nr: Int64) -> Int64:
-    return inlined_assembly[
-        "svc #0x80\n",
-        Int64,
-        constraints="={x0},{x16}",
-        has_side_effect=True,
-    ](nr)
-
-
-@always_inline
-def darwin_syscall1(nr: Int64, a0: Int64) -> Int64:
-    return inlined_assembly[
-        "svc #0x80\n",
-        Int64,
-        constraints="={x0},{x16},{x0}",
-        has_side_effect=True,
-    ](nr, a0)
-
-
-@always_inline
-def darwin_syscall2(nr: Int64, a0: Int64, a1: Int64) -> Int64:
-    return inlined_assembly[
-        "svc #0x80\n",
-        Int64,
-        constraints="={x0},{x16},{x0},{x1}",
-        has_side_effect=True,
-    ](nr, a0, a1)
-
-
-@always_inline
-def darwin_syscall3(nr: Int64, a0: Int64, a1: Int64, a2: Int64) -> Int64:
-    return inlined_assembly[
-        "svc #0x80\n",
-        Int64,
-        constraints="={x0},{x16},{x0},{x1},{x2}",
-        has_side_effect=True,
-    ](nr, a0, a1, a2)
-
-
-@always_inline
 def darwin_syscall6(
     nr: Int64,
     a0: Int64,
@@ -75,12 +41,42 @@ def darwin_syscall6(
     a4: Int64,
     a5: Int64,
 ) -> Int64:
-    return inlined_assembly[
-        "svc #0x80\n",
-        Int64,
-        constraints="={x0},{x16},{x0},{x1},{x2},{x3},{x4},{x5}",
-        has_side_effect=True,
-    ](nr, a0, a1, a2, a3, a4, a5)
+    comptime if ARCH == "x86_64":
+        # XNU x86_64 uses class 2 in the high syscall-number byte and the
+        # SysV argument registers, with argument four moved to r10.
+        return inlined_assembly[
+            "syscall\n",
+            Int64,
+            constraints="={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory},~{cc}",
+            has_side_effect=True,
+        ](nr | 0x02000000, a0, a1, a2, a3, a4, a5)
+    else:
+        return inlined_assembly[
+            "svc #0x80\n",
+            Int64,
+            constraints="={x0},{x16},{x0},{x1},{x2},{x3},{x4},{x5}",
+            has_side_effect=True,
+        ](nr, a0, a1, a2, a3, a4, a5)
+
+
+@always_inline
+def darwin_syscall0(nr: Int64) -> Int64:
+    return darwin_syscall6(nr, 0, 0, 0, 0, 0, 0)
+
+
+@always_inline
+def darwin_syscall1(nr: Int64, a0: Int64) -> Int64:
+    return darwin_syscall6(nr, a0, 0, 0, 0, 0, 0)
+
+
+@always_inline
+def darwin_syscall2(nr: Int64, a0: Int64, a1: Int64) -> Int64:
+    return darwin_syscall6(nr, a0, a1, 0, 0, 0, 0)
+
+
+@always_inline
+def darwin_syscall3(nr: Int64, a0: Int64, a1: Int64, a2: Int64) -> Int64:
+    return darwin_syscall6(nr, a0, a1, a2, 0, 0, 0)
 
 
 # ------------------------------------------------------------------------

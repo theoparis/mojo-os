@@ -148,6 +148,46 @@ def map_user(
     if start < 0 or endp > USER_VA_TOP:
         return False
 
+    comptime if ARCH == "x86_64":
+        # Four-level x86-64 paging. UEFI's CR3 supplies an identity-mapped
+        # kernel address space; retain it and create/replace only user leaves.
+        var addr = start
+        while addr < endp:
+            var table = l1
+            var shift = 39
+            while shift >= 21:
+                var index = (addr >> shift) & 0x1FF
+                var off = table + index * 8
+                var ent = read_u64(off)
+                if (ent & UInt64(1)) == 0:
+                    var next = alloc.alloc_pages(1)
+                    if next == 0:
+                        return False
+                    _zero_page(Int(next))
+                    # present | writable | user
+                    write_u64(off, UInt64(next) | UInt64(0x7))
+                    table = Int(next)
+                else:
+                    # User permission must be present at every walk level.
+                    write_u64(
+                        off,
+                        (ent | UInt64(0x6)) & UInt64(0x7FFFFFFFFFFFFFFF),
+                    )
+                    table = Int(ent & D_ADDR_MASK)
+                shift -= 9
+            var pte_off = table + ((addr >> 12) & 0x1FF) * 8
+            var frame = alloc.alloc_pages(1)
+            if frame == 0:
+                return False
+            _zero_page(Int(frame))
+            var pte = UInt64(frame) | UInt64(0x7)
+            if not exec:
+                pte = pte | UInt64(0x8000000000000000)
+            write_u64(pte_off, pte)
+            addr += PAGE_SIZE
+        flush_tlb_all()
+        return True
+
     # The leaf-parent table holding leaf pointers for the user slots:
     #  16KB -> the top table itself (l1); 4KB -> L2-A under L1[0].
     var root: Int

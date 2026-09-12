@@ -9,6 +9,7 @@ from std.sys.info import CompilationTarget
 
 from arch.console import ARCH, print_int, print_str, print_uint, println, putc
 from arch.dtb import BootParams, MemRegions, parse_dtb
+from arch.xnu_parser import is_xnu_boot_args, parse_xnu_boot_args
 from arch.mem import read_u16, read_u8
 from core.kstate import (
     OFF_FREE_HEAD,
@@ -37,6 +38,7 @@ from proc.macho import (
     load_macho,
     load_macho_dylib,
     macho_bind_fixups,
+    macho_cputype,
     macho_image_end,
     macho_is_valid,
 )
@@ -96,7 +98,17 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
     var kernel_hi = UInt64(x2)
     var l1base = x3
     var mem = MemRegions()
-    var bp = parse_dtb(x0, mem)
+    var bp = BootParams()
+    var is_xnu = False
+    if is_xnu_boot_args(x0):
+        is_xnu = True
+        print_str("[boot] detected XNU boot_args @ 0x")
+        print_uint(UInt64(x0), 16)
+        print_str("\n")
+        _ = parse_xnu_boot_args(x0, mem, bp)
+    else:
+        bp = parse_dtb(x0, mem)
+
     if not bp.has_dtb:
         print_str("[dtb] none passed in x0\n")
         if mem.n() == 0:
@@ -106,8 +118,11 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
             else:
                 mem.add(0x40000000, 128 * 1024 * 1024)
     else:
-        print_str("[dtb] @0x")
-        print_uint(UInt64(x0), 16)
+        if is_xnu:
+            print_str("[xnu-afdt] @0x")
+        else:
+            print_str("[dtb] @0x")
+        print_uint(UInt64(bp.dtb_start if is_xnu else UInt64(x0)), 16)
         if bp.has_initrd:
             print_str("  initrd [0x")
             print_uint(bp.initrd_start, 16)
@@ -195,13 +210,24 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
             var phnum: Int = 0
 
             if macho_is_valid(fdata):
-                print_str("[loader] detected Mach-O binary for /init\n")
-                imgend = macho_image_end(fdata)
-                entry = load_macho(alloc, l1base, fdata)
+                var cpu = macho_cputype(fdata)
+                comptime if ARCH == "x86_64":
+                    if cpu != 0x01000007:
+                        print_str(
+                            "[loader] /init is not an x86_64 Mach-O image\n"
+                        )
+                    else:
+                        print_str("[loader] detected Mach-O binary for /init\n")
+                        imgend = macho_image_end(fdata)
+                        entry = load_macho(alloc, l1base, fdata)
+                else:
+                    print_str("[loader] detected Mach-O binary for /init\n")
+                    imgend = macho_image_end(fdata)
+                    entry = load_macho(alloc, l1base, fdata)
 
                 # Look for dynamic library in ramfs: /usr/lib/libSystem.B.dylib
                 var sys_idx = fs.lookup("/usr/lib/libSystem.B.dylib")
-                if sys_idx >= 0:
+                if entry != 0 and sys_idx >= 0:
                     var sys_data = fs.data_addr(sys_idx)
                     var sys_slide: Int = 0x200000  # Map libSystem at 2MB VA
                     if load_macho_dylib(alloc, l1base, sys_data, sys_slide):
@@ -266,7 +292,7 @@ def boot(x0: Int, x1: Int, x2: Int, x3: Int):
                 print_str("\n[user] dropping to EL0...\n")
                 run_user(entry, sp)
             else:
-                print_str("[elf] failed to load /init\n")
+                print_str("[loader] failed to load /init\n")
         else:
             print_str("[ramfs] /init not found\n")
     else:

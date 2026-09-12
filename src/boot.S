@@ -11,10 +11,9 @@ _start:
     // x0-x3 (Linux boot protocol style): x0 = physical address of the DTB
     // (or 0 if none), x1-x3 = 0. Preserve them in callee-saved registers
     // before anything clobbers them, then hand them to kmain later.
-    mov     x28, x0     // dtb pointer
-    mov     x27, x1
-    mov     x26, x2
-    mov     x25, x3
+    mov     x28, x0     // DTB pointer or XNU boot_args pointer
+    mov     x27, x1     // UEFI kernel image low bound (0 on direct boot)
+    mov     x26, x2     // UEFI kernel image high bound
 
     // Core check: only let core 0 proceed; park others
     mrs     x0, mpidr_el1
@@ -25,6 +24,9 @@ _start:
     b       .Lpark_cpu
 
 .Lcpu_zero:
+    // UEFI may leave timer/device IRQs enabled. Mask them before installing
+    // our own vectors and replacing its translation tables.
+    msr     daifset, #0xf
     // Run the kernel in EL1h mode (its own SP_EL1 stack), so that EL0 user
     // code can freely use SP_EL0 without ever colliding with the kernel's
     // stack. (Exceptions from EL0 then arrive on SP_EL1 automatically.)
@@ -77,8 +79,16 @@ _start:
     // can repoint L1[0] at a user-address-space table and later grow L3
     // (4KB page) tables for userspace off the level-2 tables it creates.
     mov     x0, x28
+    // UEFI passes x1/x2 as image bounds. QEMU's direct boot leaves them
+    // zero, in which case use linker-defined bounds as before.
+    cbnz    x27, .Luefi_bounds
     ldr     x1, =__kernel_start
     ldr     x2, =__stack_top
+    b       .Lhave_bounds
+.Luefi_bounds:
+    mov     x1, x27
+    mov     x2, x26
+.Lhave_bounds:
     ldr     x3, =__page_table
     bl      kmain
 
@@ -264,11 +274,19 @@ setup_mmu:
     str     x0, [x21, #24]
 #endif
 
+    // Publish page-table writes before replacing the firmware's TTBR0.
+    // This is essential when entered from UEFI: its caches may otherwise
+    // retain the zeroed BSS lines while the page-table walker sees RAM.
+    dsb     ishst
     ldr     x0, =MAIR_VALUE
     msr     mair_el1, x0
     ldr     x0, =TCR_VALUE
     msr     tcr_el1, x0
+    isb
     msr     ttbr0_el1, x21
+    dsb     ish
+    tlbi    vmalle1
+    dsb     ish
     isb
 
     mrs     x0, sctlr_el1
